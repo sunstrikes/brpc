@@ -41,6 +41,15 @@
 #include "brpc/progressive_attachment.h"       // ProgressiveAttachment
 #include "brpc/progressive_reader.h"           // ProgressiveReader
 
+// EAUTH is defined in MAC
+#ifndef EAUTH
+#define EAUTH ERPCAUTH
+#endif
+
+extern "C" {
+struct x509_st;
+}
+
 namespace brpc {
 class Span;
 class Server;
@@ -116,6 +125,7 @@ friend void policy::ProcessMongoRequest(InputMessageBase*);
     static const uint32_t FLAGS_PB_BYTES_TO_BASE64 = (1 << 11);
     static const uint32_t FLAGS_ALLOW_DONE_TO_RUN_IN_PLACE = (1 << 12);
     static const uint32_t FLAGS_USED_BY_RPC = (1 << 13);
+    static const uint32_t FLAGS_REQUEST_WITH_AUTH = (1 << 15);
     
 public:
     Controller();
@@ -300,6 +310,12 @@ public:
     // Returns the authenticated result. NULL if there is no authentication
     const AuthContext* auth_context() const { return _auth_context; }
 
+    // Whether the underlying channel is using SSL
+    bool is_ssl() const;
+
+    // Get the peer certificate, which can be printed by ostream
+    x509_st* get_peer_certificate() const;
+
     // Mutable header of http response.
     HttpHeader& http_response() {
         if (_http_response == NULL) {
@@ -332,7 +348,7 @@ public:
     // Tell RPC to close the connection instead of sending back response.
     // If this controller was not SetFailed() before, ErrorCode() will be
     // set to ECLOSE.
-    // Notice that the actual closing does not take place immediately.
+    // NOTE: the underlying connection is not closed immediately.
     void CloseConnection(const char* reason_fmt, ...);
 
     // True if CloseConnection() was called.
@@ -374,15 +390,16 @@ public:
     // Protocol of the request sent by client or received by server.
     ProtocolType request_protocol() const { return _request_protocol; }
 
-    // Whether the underlying channel is using SSL
-    bool is_ssl() const;
-    
     // Resets the Controller to its initial state so that it may be reused in
     // a new call.  Must NOT be called while an RPC is in progress.
     void Reset() { InternalReset(false); }
     
     // Causes Failed() to return true on the client side.  "reason" will be
     // incorporated into the message returned by ErrorText().
+    // NOTE: Change http_response().status_code() according to `error_code'
+    // as well if the protocol is HTTP. If you want to overwrite the 
+    // status_code, call http_response().set_status_code() after SetFailed()
+    // (rather than before SetFailed)
     void SetFailed(const std::string& reason);
     void SetFailed(int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));

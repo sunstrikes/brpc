@@ -167,7 +167,7 @@ void DYNAMIC_ANNOTATIONS_NAME(AnnotateBenignRace)(
 {DYNAMIC_ANNOTATIONS_IMPL}
 
 void DYNAMIC_ANNOTATIONS_NAME(AnnotateBenignRaceSized)(
-    const char *file, int line, const volatile void *mem, long size,
+    const char *file, int line, const volatile void *mem, size_t size,
     const char *description)
 {DYNAMIC_ANNOTATIONS_IMPL}
 
@@ -255,7 +255,7 @@ static int GetRunningOnValgrind(void) {
 }
 
 /* See the comments in dynamic_annotations.h */
-int RunningOnValgrind(void) {
+int __attribute__((weak)) RunningOnValgrind(void) {
   static volatile int running_on_valgrind = -1;
   /* C doesn't have thread-safe initialization of statics, and we
      don't want to depend on pthread_once here, so hack it. */

@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
-//          Ge,Jun (gejun@baidu.com)
 
 #include <cstdlib>
 
@@ -32,8 +33,10 @@
 
 namespace brpc {
 
+DEFINE_bool(allow_chunked_length, false,
+            "Allow both Transfer-Encoding and Content-Length headers are present.");
 DEFINE_bool(http_verbose, false,
-            "[DEBUG] Print EVERY http request/response to stderr");
+            "[DEBUG] Print EVERY http request/response");
 DEFINE_int32(http_verbose_max_body_length, 512,
              "[DEBUG] Max body length printed when -http_verbose is on");
 DECLARE_int64(socket_max_unwritten_bytes);
@@ -106,18 +109,18 @@ int HttpMessage::on_header_value(http_parser *parser,
         http_message->_cur_value->append(at, length);
     }
     if (FLAGS_http_verbose) {
-        butil::IOBufBuilder* vs = http_message->_vmsgbuilder;
+        butil::IOBufBuilder* vs = http_message->_vmsgbuilder.get();
         if (vs == NULL) {
             vs = new butil::IOBufBuilder;
-            http_message->_vmsgbuilder = vs;
+            http_message->_vmsgbuilder.reset(vs);
             if (parser->type == HTTP_REQUEST) {
-                *vs << "[HTTP REQUEST @" << butil::my_ip() << "]\n< "
+                *vs << "[ HTTP REQUEST @" << butil::my_ip() << " ]\n< "
                     << HttpMethod2Str((HttpMethod)parser->method) << ' '
                     << http_message->_url << " HTTP/" << parser->http_major
                     << '.' << parser->http_minor;
             } else {
                 // NOTE: http_message->header().status_code() may not be set yet.
-                *vs << "[HTTP RESPONSE @" << butil::my_ip() << "]\n< HTTP/"
+                *vs << "[ HTTP RESPONSE @" << butil::my_ip() << " ]\n< HTTP/"
                     << parser->http_major
                     << '.' << parser->http_minor << ' ' << parser->status_code
                     << ' ' << HttpReasonPhrase(parser->status_code);
@@ -133,13 +136,7 @@ int HttpMessage::on_header_value(http_parser *parser,
 
 int HttpMessage::on_headers_complete(http_parser *parser) {
     HttpMessage *http_message = (HttpMessage *)parser->data;
-    http_message->_stage = HTTP_ON_HEADERS_COMPLELE;
-    // Move content-type into the member field.
-    const std::string* content_type = http_message->header().GetHeader("content-type");
-    if (content_type) {
-        http_message->header().set_content_type(*content_type);
-        http_message->header().RemoveHeader("content-type");
-    }
+    http_message->_stage = HTTP_ON_HEADERS_COMPLETE;
     if (parser->http_major > 1) {
         // NOTE: this checking is a MUST because ProcessHttpResponse relies
         // on it to cast InputMessageBase* into different types.
@@ -175,6 +172,35 @@ int HttpMessage::on_headers_complete(http_parser *parser) {
         if (host_header != NULL) {
             uri.SetHostAndPort(*host_header);
         }
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.3
+    // If a message is received with both a Transfer-Encoding and a
+    // Content-Length header field, the Transfer-Encoding overrides the
+    // Content-Length. Such a message might indicate an attempt to
+    // perform request smuggling (Section 9.5) or response splitting
+    // (Section 9.4) and ought to be handled as an error. A sender MUST
+    // remove the received Content-Length field prior to forwarding such
+    // a message.
+
+    // Reject message if both Transfer-Encoding and Content-Length headers
+    // are present or if allowed by gflag and 'Transfer-Encoding'
+    // is chunked - remove Content-Length and serve request.
+    if (parser->uses_transfer_encoding && parser->flags & F_CONTENTLENGTH) {
+        if (parser->flags & F_CHUNKED && FLAGS_allow_chunked_length) {
+            http_message->header().RemoveHeader("Content-Length");
+        } else {
+            LOG(ERROR) << "HTTP/1.1 protocol error: both Content-Length "
+                       << "and Transfer-Encoding are set.";
+            return -1;
+        }
+    }
+
+    // If server receives a response to a HEAD request, returns 1 and then
+    // the parser will interpret that as saying that this message has no body.
+    if (parser->type == HTTP_RESPONSE &&
+        http_message->request_method() == HTTP_METHOD_HEAD) {
+        return 1;
     }
     return 0;
 }
@@ -221,16 +247,17 @@ int HttpMessage::OnBody(const char *at, const size_t length) {
             // description which is very helpful for debugging. Otherwise
             // the body is probably streaming data which is too long to print.
             header().status_code() == HTTP_STATUS_OK) {
-            std::cerr << _vmsgbuilder->buf() << std::endl;
-            delete _vmsgbuilder;
-            _vmsgbuilder = NULL;
+            LOG(INFO) << '\n' << _vmsgbuilder->buf();
+            _vmsgbuilder.reset(NULL);
         } else {
-            if (_body_length < (size_t)FLAGS_http_verbose_max_body_length) {
+            if (_vbodylen < (size_t)FLAGS_http_verbose_max_body_length) {
                 int plen = std::min(length, (size_t)FLAGS_http_verbose_max_body_length
-                                    - _body_length);
-                _vmsgbuilder->write(at, plen);
+                                    - _vbodylen);
+                std::string str = butil::ToPrintableString(
+                    at, plen, std::numeric_limits<size_t>::max());
+                _vmsgbuilder->write(str.data(), str.size());
             }
-            _body_length += length;
+            _vbodylen += length;
         }
     }
     if (_stage != HTTP_ON_BODY) {
@@ -280,24 +307,23 @@ int HttpMessage::OnBody(const char *at, const size_t length) {
 
 int HttpMessage::OnMessageComplete() {
     if (_vmsgbuilder) {
-        if (_body_length > (size_t)FLAGS_http_verbose_max_body_length) {
-            *_vmsgbuilder << "\n<skipped " << _body_length
+        if (_vbodylen > (size_t)FLAGS_http_verbose_max_body_length) {
+            *_vmsgbuilder << "\n<skipped " << _vbodylen
                 - (size_t)FLAGS_http_verbose_max_body_length << " bytes>";
         }
-        std::cerr << _vmsgbuilder->buf() << std::endl;
-        delete _vmsgbuilder;
-        _vmsgbuilder = NULL;
+        LOG(INFO) << '\n' << _vmsgbuilder->buf();
+        _vmsgbuilder.reset(NULL);
     }
     _cur_header.clear();
     _cur_value = NULL;
     if (!_read_body_progressively) {
         // Normal read.
-        _stage = HTTP_ON_MESSAGE_COMPLELE;
+        _stage = HTTP_ON_MESSAGE_COMPLETE;
         return 0;
     }
     // Progressive read.
     std::unique_lock<butil::Mutex> mu(_body_mutex);
-    _stage = HTTP_ON_MESSAGE_COMPLELE;
+    _stage = HTTP_ON_MESSAGE_COMPLETE;
     if (_body_reader != NULL) {
         // Solve the case: SetBodyReader quit at ntry=MAX_TRY with non-empty
         // _body and the remaining _body is just the last part.
@@ -389,15 +415,17 @@ const http_parser_settings g_parser_settings = {
     &HttpMessage::on_message_complete_cb
 };
 
-HttpMessage::HttpMessage(bool read_body_progressively)
+HttpMessage::HttpMessage(bool read_body_progressively,
+                         HttpMethod request_method)
     : _parsed_length(0)
     , _stage(HTTP_ON_MESSAGE_BEGIN)
+    , _request_method(request_method)
     , _read_body_progressively(read_body_progressively)
     , _body_reader(NULL)
     , _cur_value(NULL)
-    , _vmsgbuilder(NULL)
-    , _body_length(0) {
+    , _vbodylen(0) {
     http_parser_init(&_parser, HTTP_BOTH);
+    _parser.allow_chunked_length = 1;
     _parser.data = this;
 }
 
@@ -456,7 +484,7 @@ ssize_t HttpMessage::ParseFromIOBuf(const butil::IOBuf &buf) {
         if (_parser.http_errno != 0) {
             // May try HTTP on other formats, failure is norm.
             RPC_VLOG << "Fail to parse http message, parser=" << _parser
-                     << ", buf=`" << buf << '\'';
+                     << ", buf=" << butil::ToPrintable(buf);
             return -1;
         }
         if (Completed()) {
@@ -486,6 +514,9 @@ static void DescribeHttpParserFlags(std::ostream& os, unsigned int flags) {
     if (flags & F_SKIPBODY) {
         os << "F_SKIPBODY|";
     }
+    if (flags & F_CONTENTLENGTH) {
+        os << "F_CONTENTLENGTH|";
+    }
 }
 
 std::ostream& operator<<(std::ostream& os, const http_parser& parser) {
@@ -508,8 +539,7 @@ std::ostream& operator<<(std::ostream& os, const http_parser& parser) {
     if (parser.type == HTTP_REQUEST || parser.type == HTTP_BOTH) {
         os << " method=" << HttpMethod2Str((HttpMethod)parser.method);
     }
-    os << " upgrade=" << parser.upgrade
-       << " data=" << parser.data
+    os << " data=" << parser.data
        << '}';
     return os;
 }
@@ -534,21 +564,32 @@ std::ostream& operator<<(std::ostream& os, const http_parser& parser) {
 //                | "CONNECT"                ; Section 9.9
 //                | extension-method
 // extension-method = token
-void SerializeHttpRequest(butil::IOBuf* request,
-                          HttpHeader* h,
-                          const butil::EndPoint& remote_side,
-                          const butil::IOBuf* content) {
+void MakeRawHttpRequest(butil::IOBuf* request,
+                        HttpHeader* h,
+                        const butil::EndPoint& remote_side,
+                        const butil::IOBuf* content) {
     butil::IOBufBuilder os;
     os << HttpMethod2Str(h->method()) << ' ';
     const URI& uri = h->uri();
     uri.PrintWithoutHost(os); // host is sent by "Host" header.
     os << " HTTP/" << h->major_version() << '.'
        << h->minor_version() << BRPC_CRLF;
-    if (h->method() != HTTP_METHOD_GET) {
-        h->RemoveHeader("Content-Length");
-        // Never use "Content-Length" set by user.
+    // Never use "Content-Length" set by user.
+    h->RemoveHeader("Content-Length");
+    const std::string* transfer_encoding = h->GetHeader("Transfer-Encoding");
+    if (h->method() == HTTP_METHOD_GET) {
+        h->RemoveHeader("Transfer-Encoding");
+    } else if (!transfer_encoding) {
+        // https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.2
+        // A sender MUST NOT send a Content-Length header field in any message
+        // that contains a Transfer-Encoding header field.
         os << "Content-Length: " << (content ? content->length() : 0)
            << BRPC_CRLF;
+    }
+    // `Expect: 100-continue' is not supported, remove it.
+    const std::string* expect = h->GetHeader("Expect");
+    if (expect && *expect == "100-continue") {
+        h->RemoveHeader("Expect");
     }
     //rfc 7230#section-5.4:
     //A client MUST send a Host header field in all HTTP/1.1 request
@@ -557,7 +598,7 @@ void SerializeHttpRequest(butil::IOBuf* request,
     //empty field-value.
     //rfc 7231#sec4.3:
     //the request-target consists of only the host name and port number of 
-    //the tunnel destination, seperated by a colon. For example,
+    //the tunnel destination, separated by a colon. For example,
     //Host: server.example.com:80
     if (h->GetHeader("host") == NULL) {
         os << "Host: ";
@@ -611,21 +652,56 @@ void SerializeHttpRequest(butil::IOBuf* request,
 //                CRLF
 //                [ message-body ]          ; Section 7.2
 // Status-Line = HTTP-Version SP Status-Code SP Reason-Phrase CRLF
-void SerializeHttpResponse(butil::IOBuf* response,
-                           HttpHeader* h,
-                           butil::IOBuf* content) {
+void MakeRawHttpResponse(butil::IOBuf* response,
+                         HttpHeader* h,
+                         butil::IOBuf* content) {
     butil::IOBufBuilder os;
     os << "HTTP/" << h->major_version() << '.'
        << h->minor_version() << ' ' << h->status_code()
        << ' ' << h->reason_phrase() << BRPC_CRLF;
-    if (content) {
+    bool is_invalid_content = h->status_code() < HTTP_STATUS_OK ||
+                              h->status_code() == HTTP_STATUS_NO_CONTENT;
+    bool is_head_req = h->method() == HTTP_METHOD_HEAD;
+    if (is_invalid_content) {
+        // https://www.rfc-editor.org/rfc/rfc7230#section-3.3.1
+        // A server MUST NOT send a Transfer-Encoding header field in any
+        // response with a status code of 1xx (Informational) or 204 (No
+        // Content).
+        h->RemoveHeader("Transfer-Encoding");
+        // https://www.rfc-editor.org/rfc/rfc7230#section-3.3.2
+        // A server MUST NOT send a Content-Length header field in any response
+        // with a status code of 1xx (Informational) or 204 (No Content).
         h->RemoveHeader("Content-Length");
-        // Never use "Content-Length" set by user.
-        // Always set Content-Length since lighttpd requires the header to be
-        // set to 0 for empty content.
-        os << "Content-Length: " << content->length() << BRPC_CRLF;
+    } else {
+        const std::string* transfer_encoding = h->GetHeader("Transfer-Encoding");
+        // https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.2
+        // A sender MUST NOT send a Content-Length header field in any message
+        // that contains a Transfer-Encoding header field.
+        if (transfer_encoding) {
+            h->RemoveHeader("Content-Length");
+        }
+        if (content) {
+            const std::string* content_length = h->GetHeader("Content-Length");
+            if (is_head_req) {
+                if (!content_length && !transfer_encoding) {
+                    // Prioritize "Content-Length" set by user.
+                    // If "Content-Length" is not set, set it to the length of content.
+                    os << "Content-Length: " << content->length() << BRPC_CRLF;
+                }
+            } else {
+                if (!transfer_encoding) {
+                    if (content_length) {
+                        h->RemoveHeader("Content-Length");
+                    }
+                    // Never use "Content-Length" set by user.
+                    // Always set Content-Length since lighttpd requires the header to be
+                    // set to 0 for empty content.
+                    os << "Content-Length: " << content->length() << BRPC_CRLF;
+                }
+            }
+        }
     }
-    if (!h->content_type().empty()) {
+    if (!is_invalid_content && !h->content_type().empty()) {
         os << "Content-Type: " << h->content_type()
            << BRPC_CRLF;
     }
@@ -635,7 +711,12 @@ void SerializeHttpResponse(butil::IOBuf* response,
     }
     os << BRPC_CRLF;  // CRLF before content
     os.move_to(*response);
-    if (content) {
+
+    // https://datatracker.ietf.org/doc/html/rfc7231#section-4.3.2
+    // The HEAD method is identical to GET except that the server MUST NOT
+    // send a message body in the response (i.e., the response terminates at
+    // the end of the header section).
+    if (!is_invalid_content && !is_head_req && content) {
         response->append(butil::IOBuf::Movable(*content));
     }
 }

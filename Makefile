@@ -1,29 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 NEED_LIBPROTOC=1
 include config.mk
 
 # Notes on the flags:
 # 1. Added -fno-omit-frame-pointer: perf/tcmalloc-profiler use frame pointers by default
-# 2. Added -D__const__= : Avoid over-optimizations of TLS variables by GCC>=4.8
-# 3. Removed -Werror: Not block compilation for non-vital warnings, especially when the
+# 2. Removed -Werror: Not block compilation for non-vital warnings, especially when the
 #    code is tested on newer systems. If the code is used in production, add -Werror back
-CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D__const__= -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DNDEBUG -DBRPC_REVISION=\"$(shell git rev-parse --short HEAD)\"
-CXXFLAGS=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer -std=c++0x
+CPPFLAGS+=-DBTHREAD_USE_FAST_PTHREAD_MUTEX -D_GNU_SOURCE -DUSE_SYMBOLIZE -DNO_TCMALLOC -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -DNDEBUG -DBRPC_REVISION=\"$(shell ./tools/get_brpc_revision.sh .)\"
+CXXFLAGS+=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-invalid-offsetof -Wno-unused-parameter -fno-omit-frame-pointer
 CFLAGS=$(CPPFLAGS) -O2 -pipe -Wall -W -fPIC -fstrict-aliasing -Wno-unused-parameter -fno-omit-frame-pointer
 DEBUG_CXXFLAGS = $(filter-out -DNDEBUG,$(CXXFLAGS)) -DUNIT_TEST -DBVAR_NOT_LINK_DEFAULT_VARIABLES
 DEBUG_CFLAGS = $(filter-out -DNDEBUG,$(CFLAGS)) -DUNIT_TEST
 HDRPATHS=-I./src $(addprefix -I, $(HDRS))
 LIBPATHS = $(addprefix -L, $(LIBS))
 COMMA = ,
-SOPATHS = $(addprefix -Wl$(COMMA)-rpath=, $(LIBS))
+SOPATHS = $(addprefix -Wl$(COMMA)-rpath$(COMMA), $(LIBS))
 SRCEXTS = .c .cc .cpp .proto
+
+SOEXT = so
+ifeq ($(SYSTEM),Darwin)
+    SOEXT = dylib
+endif
 
 #required by butil/crc32.cc to boost performance for 10x
 ifeq ($(shell test $(GCC_VERSION) -ge 40400; echo $$?),0)
-	CXXFLAGS+=-msse4 -msse4.2
+  ifeq ($(shell uname -p),i386)  #note: i386 is processor family type, not the 32-bit x86 arch
+    CXXFLAGS+=-msse4 -msse4.2
+  endif
 endif
 #not solved yet
-ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
-	CXXFLAGS+=-Wno-aligned-new
+ifeq ($(CC),gcc)
+  ifeq ($(shell test $(GCC_VERSION) -ge 70000; echo $$?),0)
+    CXXFLAGS+=-Wno-aligned-new
+  endif
 endif
 
 BUTIL_SOURCES = \
@@ -33,7 +58,6 @@ BUTIL_SOURCES = \
     src/butil/third_party/icu/icu_utf.cc \
     src/butil/third_party/superfasthash/superfasthash.c \
     src/butil/third_party/modp_b64/modp_b64.cc \
-    src/butil/third_party/nspr/prtime.cc \
     src/butil/third_party/symbolize/demangle.cc \
     src/butil/third_party/symbolize/symbolize.cc \
     src/butil/third_party/snappy/snappy-sinksource.cc \
@@ -44,6 +68,7 @@ BUTIL_SOURCES = \
     src/butil/at_exit.cc \
     src/butil/atomicops_internals_x86_gcc.cc \
     src/butil/base64.cc \
+    src/butil/base64url.cc \
     src/butil/big_endian.cc \
     src/butil/cpu.cc \
     src/butil/debug/alias.cc \
@@ -73,7 +98,6 @@ BUTIL_SOURCES = \
     src/butil/hash.cc \
     src/butil/lazy_instance.cc \
     src/butil/location.cc \
-    src/butil/md5.cc \
     src/butil/memory/aligned_memory.cc \
     src/butil/memory/ref_counted.cc \
     src/butil/memory/ref_counted_memory.cc \
@@ -81,6 +105,7 @@ BUTIL_SOURCES = \
     src/butil/memory/weak_ptr.cc \
     src/butil/posix/file_descriptor_shuffle.cc \
     src/butil/posix/global_descriptors.cc \
+    src/butil/process_util.cc \
     src/butil/rand_util.cc \
     src/butil/rand_util_posix.cc \
     src/butil/fast_rand.cpp \
@@ -96,7 +121,6 @@ BUTIL_SOURCES = \
     src/butil/strings/string_util.cc \
     src/butil/strings/string_util_constants.cc \
     src/butil/strings/stringprintf.cc \
-    src/butil/strings/sys_string_conversions_posix.cc \
     src/butil/strings/utf_offset_string_conversions.cc \
     src/butil/strings/utf_string_conversion_utils.cc \
     src/butil/strings/utf_string_conversions.cc \
@@ -128,6 +152,7 @@ BUTIL_SOURCES = \
     src/butil/status.cpp \
     src/butil/string_printf.cpp \
     src/butil/thread_local.cpp \
+    src/butil/thread_key.cpp \
     src/butil/unix_socket.cpp \
     src/butil/endpoint.cpp \
     src/butil/fd_utility.cpp \
@@ -138,15 +163,24 @@ BUTIL_SOURCES = \
     src/butil/crc32c.cc \
     src/butil/containers/case_ignored_flat_map.cpp \
     src/butil/iobuf.cpp \
+    src/butil/iobuf_profiler.cpp \
+    src/butil/binary_printer.cpp \
+    src/butil/recordio.cc \
     src/butil/popen.cpp
 
 ifeq ($(SYSTEM), Linux)
     BUTIL_SOURCES += src/butil/file_util_linux.cc \
-		src/butil/threading/platform_thread_linux.cc
+        src/butil/threading/platform_thread_linux.cc \
+        src/butil/strings/sys_string_conversions_posix.cc
 endif
 ifeq ($(SYSTEM), Darwin)
     BUTIL_SOURCES += src/butil/mac/bundle_locations.mm \
-		src/butil/mac/foundation_util.mm
+		src/butil/mac/foundation_util.mm \
+		src/butil/file_util_mac.mm \
+		src/butil/threading/platform_thread_mac.mm \
+		src/butil/strings/sys_string_conversions_mac.mm \
+		src/butil/time/time_mac.cc \
+		src/butil/mac/scoped_mach_port.cc
 endif
 
 BUTIL_OBJS = $(addsuffix .o, $(basename $(BUTIL_SOURCES)))
@@ -163,8 +197,11 @@ JSON2PB_DIRS = src/json2pb
 JSON2PB_SOURCES = $(foreach d,$(JSON2PB_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
 JSON2PB_OBJS = $(addsuffix .o, $(basename $(JSON2PB_SOURCES))) 
 
-BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy
-BRPC_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
+BRPC_DIRS = src/brpc src/brpc/details src/brpc/builtin src/brpc/policy src/brpc/rdma
+THRIFT_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/thrift*,$(SRCEXTS))))
+EXCLUDE_SOURCES = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/event_dispatcher_*,$(SRCEXTS))))
+BRPC_SOURCES_ALL = $(foreach d,$(BRPC_DIRS),$(wildcard $(addprefix $(d)/*,$(SRCEXTS))))
+BRPC_SOURCES = $(filter-out $(THRIFT_SOURCES) $(EXCLUDE_SOURCES), $(BRPC_SOURCES_ALL))
 BRPC_PROTOS = $(filter %.proto,$(BRPC_SOURCES))
 BRPC_CFAMILIES = $(filter-out %.proto %.pb.cc,$(BRPC_SOURCES))
 BRPC_OBJS = $(BRPC_PROTOS:.proto=.pb.o) $(addsuffix .o, $(basename $(BRPC_CFAMILIES)))
@@ -176,7 +213,11 @@ MCPACK2PB_SOURCES = \
 	src/mcpack2pb/serializer.cpp
 MCPACK2PB_OBJS = src/idl_options.pb.o $(addsuffix .o, $(basename $(MCPACK2PB_SOURCES)))
 
-OBJS=$(BUTIL_OBJS) $(BVAR_OBJS) $(BTHREAD_OBJS) $(JSON2PB_OBJS) $(MCPACK2PB_OBJS) $(BRPC_OBJS)
+ifeq (ENABLE_THRIFT_FRAMED_PROTOCOL, $(findstring ENABLE_THRIFT_FRAMED_PROTOCOL, $(CPPFLAGS)))
+    THRIFT_OBJS = $(addsuffix .o, $(basename $(THRIFT_SOURCES)))
+endif
+
+OBJS=$(BUTIL_OBJS) $(BVAR_OBJS) $(BTHREAD_OBJS) $(JSON2PB_OBJS) $(MCPACK2PB_OBJS) $(BRPC_OBJS) $(THRIFT_OBJS)
 
 BVAR_DEBUG_OBJS=$(BUTIL_OBJS:.o=.dbg.o) $(BVAR_OBJS:.o=.dbg.o)
 DEBUG_OBJS = $(OBJS:.o=.dbg.o)
@@ -184,94 +225,117 @@ DEBUG_OBJS = $(OBJS:.o=.dbg.o)
 PROTOS=$(BRPC_PROTOS) src/idl_options.proto
 
 .PHONY:all
-all:  protoc-gen-mcpack libbrpc.a libbrpc.so output/include output/lib output/bin
+all:  protoc-gen-mcpack libbrpc.a libbrpc.$(SOEXT) output/include output/lib output/bin
 
 .PHONY:debug
-debug: test/libbrpc.dbg.a test/libbvar.dbg.a
+debug: test/libbrpc.dbg.$(SOEXT) test/libbvar.dbg.a
 
 .PHONY:clean
 clean:
-	@echo "Cleaning"
-	@rm -rf src/mcpack2pb/generator.o protoc-gen-mcpack libbrpc.a libbrpc.so $(OBJS) output/include output/lib output/bin $(PROTOS:.proto=.pb.h) $(PROTOS:.proto=.pb.cc)
+	@echo "> Cleaning"
+	rm -rf src/mcpack2pb/generator.o protoc-gen-mcpack libbrpc.a libbrpc.$(SOEXT) $(OBJS) output/include output/lib output/bin $(PROTOS:.proto=.pb.h) $(PROTOS:.proto=.pb.cc)
 
 .PHONY:clean_debug
 clean_debug:
-	@rm -rf test/libbrpc.dbg.a test/libbvar.dbg.a $(DEBUG_OBJS)
+	rm -rf test/libbrpc.dbg.$(SOEXT) test/libbvar.dbg.a $(DEBUG_OBJS)
 
 .PRECIOUS: %.o
 
 protoc-gen-mcpack: src/idl_options.pb.cc src/mcpack2pb/generator.o libbrpc.a
-	@echo "Linking $@"
-	@$(CXX) -o $@ $(HDRPATHS) $(LIBPATHS) -Xlinker "-(" $^ -Wl,-Bstatic $(STATIC_LINKINGS) -Wl,-Bdynamic -Xlinker "-)" $(DYNAMIC_LINKINGS)
+	@echo "> Linking $@"
+ifeq ($(SYSTEM),Linux)
+	$(CXX) -o $@ $(CXXFLAGS) $(HDRPATHS) $(LIBPATHS) -Xlinker "-(" $^ -Wl,-Bstatic $(STATIC_LINKINGS) -Wl,-Bdynamic -Xlinker "-)" $(DYNAMIC_LINKINGS)
+else ifeq ($(SYSTEM),Darwin)
+	$(CXX) -o $@ $(CXXFLAGS) $(HDRPATHS) $(LIBPATHS) $^ $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+endif
 
 # force generation of pb headers before compiling to avoid fail-to-import issues in compiling pb.cc
 libbrpc.a:$(BRPC_PROTOS:.proto=.pb.h) $(OBJS)
-	@echo "Packing $@"
-	@ar crs $@ $(filter %.o,$^)
+	@echo "> Packing $@"
+	ar crs $@ $(filter %.o,$^)
 
-libbrpc.so:$(BRPC_PROTOS:.proto=.pb.h) $(OBJS)
-	@echo "Linking $@"
-	@$(CXX) -shared -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $(filter %.o,$^) -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+libbrpc.$(SOEXT):$(BRPC_PROTOS:.proto=.pb.h) $(OBJS)
+	@echo "> Linking $@"
+ifeq ($(SYSTEM),Linux)
+	$(CXX) -shared -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $(filter %.o,$^) -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+else ifeq ($(SYSTEM),Darwin)
+	$(CXX) -dynamiclib -Wl,-headerpad_max_install_names -o $@ -install_name @rpath/$@ $(LIBPATHS) $(SOPATHS) $(filter %.o,$^) $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+endif
 
 test/libbvar.dbg.a:$(BVAR_DEBUG_OBJS)
-	@echo "Packing $@"
+	@echo "> Packing $@"
 	@ar crs $@ $^
 
-test/libbrpc.dbg.a:$(BRPC_PROTOS:.proto=.pb.h) $(DEBUG_OBJS)
-	@echo "Packing $@"
-	@ar crs $@ $(filter %.o,$^)
+test/libbrpc.dbg.$(SOEXT):$(BRPC_PROTOS:.proto=.pb.h) $(DEBUG_OBJS)
+	@echo "> Linking $@"
+ifeq ($(SYSTEM),Linux)
+	$(CXX) -shared -o $@ $(LIBPATHS) $(SOPATHS) -Xlinker "-(" $(filter %.o,$^) -Xlinker "-)" $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+else ifeq ($(SYSTEM),Darwin)
+	$(CXX) -dynamiclib -Wl,-headerpad_max_install_names -o $@ -install_name @rpath/libbrpc.dbg.$(SOEXT) $(LIBPATHS) $(SOPATHS) $(filter %.o,$^) $(STATIC_LINKINGS) $(DYNAMIC_LINKINGS)
+endif
 
 .PHONY:output/include
 output/include:
-	@echo "Copying to $@"
+	@echo "> Copying to $@"
 	@for dir in `find src -type f -name "*.h" -exec dirname {} \\; | sed -e 's/^src\///g' -e '/^src$$/d' | sort | uniq`; do mkdir -p $@/$$dir && cp src/$$dir/*.h $@/$$dir/; done
 	@for dir in `find src -type f -name "*.hpp" -exec dirname {} \\; | sed -e 's/^src\///g' -e '/^src$$/d' | sort | uniq`; do mkdir -p $@/$$dir && cp src/$$dir/*.hpp $@/$$dir/; done
 	@cp src/idl_options.proto src/idl_options.pb.h $@
 
 .PHONY:output/lib
-output/lib:libbrpc.a libbrpc.so
-	@echo "Copying to $@"
+output/lib:libbrpc.a libbrpc.$(SOEXT)
+	@echo "> Copying to $@"
 	@mkdir -p $@
 	@cp $^ $@
 
 .PHONY:output/bin
 output/bin:protoc-gen-mcpack
-	@echo "Copying to $@"
+	@echo "> Copying to $@"
 	@mkdir -p $@
 	@cp $^ $@
 
 %.pb.cc %.pb.h:%.proto
-	@echo "Generating $@"
-	@$(PROTOC) --cpp_out=./src --proto_path=./src --proto_path=$(PROTOBUF_HDR) $<
+	@echo "> Generating $@"
+	$(PROTOC) --cpp_out=./src --proto_path=./src --proto_path=$(PROTOBUF_HDR) $<
+
+src/mcpack2pb/generator.o:src/mcpack2pb/generator.cpp src/idl_options.pb.h
+	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
 
 %.o:%.cpp
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+
+%http2_rpc_protocol.dbg.o:%http2_rpc_protocol.cpp
+	@echo "> Compiling $@ with O2"
+	$(CXX) -c $(HDRPATHS) -O2 $(DEBUG_CXXFLAGS) $< -o $@
+
+%hpack.dbg.o:%hpack.cpp
+	@echo "> Compiling $@ with O2"
+	$(CXX) -c $(HDRPATHS) -O2 $(DEBUG_CXXFLAGS) $< -o $@
 
 %.dbg.o:%.cpp
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
 
 %.o:%.cc
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
 
 %.dbg.o:%.cc
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
 
 %.o:%.mm
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(CXXFLAGS) $< -o $@
 
 %.dbg.o:%.mm
-	@echo "Compiling $@"
-	@$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CXX) -c $(HDRPATHS) $(DEBUG_CXXFLAGS) $< -o $@
 
 %.o:%.c
-	@echo "Compiling $@"
-	@$(CC) -c $(HDRPATHS) $(CFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CC) -c $(HDRPATHS) $(CFLAGS) $< -o $@
 
 %.dbg.o:%.c
-	@echo "Compiling $@"
-	@$(CC) -c $(HDRPATHS) $(DEBUG_CFLAGS) $< -o $@
+	@echo "> Compiling $@"
+	$(CC) -c $(HDRPATHS) $(DEBUG_CFLAGS) $< -o $@

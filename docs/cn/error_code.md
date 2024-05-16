@@ -1,6 +1,6 @@
 [English version](../en/error_code.md)
 
-brpc使用[brpc::Controller](https://github.com/brpc/brpc/blob/master/src/brpc/controller.h)设置和获取一次RPC的参数，`Controller::ErrorCode()`和`Controller::ErrorText()`则分别是该次RPC的错误码和错误描述，RPC结束后才能访问，否则结果未定义。ErrorText()由Controller的基类google::protobuf::RpcController定义，ErrorCode()则是brpc::Controller定义的。Controller还有个Failed()方法告知该次RPC是否失败，这三者的关系是：
+brpc使用[brpc::Controller](https://github.com/apache/brpc/blob/master/src/brpc/controller.h)设置和获取一次RPC的参数，`Controller::ErrorCode()`和`Controller::ErrorText()`则分别是该次RPC的错误码和错误描述，RPC结束后才能访问，否则结果未定义。ErrorText()由Controller的基类google::protobuf::RpcController定义，ErrorCode()则是brpc::Controller定义的。Controller还有个Failed()方法告知该次RPC是否失败，这三者的关系是：
 
 - 当Failed()为true时，ErrorCode()一定为非0，ErrorText()则为非空。
 - 当Failed()为false时，ErrorCode()一定为0，ErrorText()未定义（目前在brpc中会为空，但你最好不要依赖这个事实）
@@ -15,9 +15,9 @@ server端Controller的SetFailed()常由用户在服务回调中调用。当处�
 
 # brpc的错误码
 
-brpc使用的所有ErrorCode都定义在[errno.proto](https://github.com/brpc/brpc/blob/master/src/brpc/errno.proto)中，*SYS_*开头的来自linux系统，与/usr/include/errno.h中定义的精确一致，定义在proto中是为了跨语言。其余的是brpc自有的。
+brpc使用的所有ErrorCode都定义在[errno.proto](https://github.com/apache/brpc/blob/master/src/brpc/errno.proto)中，*SYS_*开头的来自linux系统，与/usr/include/errno.h中定义的精确一致，定义在proto中是为了跨语言。其余的是brpc自有的。
 
-[berror(error_code)](https://github.com/brpc/brpc/blob/master/src/butil/errno.h)可获得error_code的描述，berror()可获得当前[system errno](http://www.cplusplus.com/reference/cerrno/errno/)的描述。**ErrorText() != berror(ErrorCode())**，ErrorText()会包含更具体的错误信息。brpc默认包含berror，你可以直接使用。
+[berror(error_code)](https://github.com/apache/brpc/blob/master/src/butil/errno.h)可获得error_code的描述，berror()可获得当前[system errno](http://www.cplusplus.com/reference/cerrno/errno/)的描述。**ErrorText() != berror(ErrorCode())**，ErrorText()会包含更具体的错误信息。brpc默认包含berror，你可以直接使用。
 
 brpc中常见错误的打印内容列表如下：
 
@@ -26,8 +26,9 @@ brpc中常见错误的打印内容列表如下：
 | 错误码            | 数值   | 重试   | 说明                                       | 日志                                       |
 | -------------- | ---- | ---- | ---------------------------------------- | ---------------------------------------- |
 | EAGAIN         | 11   | 是    | 同时发送的请求过多。软限，很少出现。                       | Resource temporarily unavailable         |
+| ENODATA        | 61   | 是    | 1. Naming Service返回的server列表为空 2. Naming Service某次变更时，所有实例都发生了修改，Naming Service更新LB的逻辑是先Remove再Add，会存在很短时间内LB实例列表为空的情况 | Fail to select server from xxx |
 | ETIMEDOUT      | 110  | 是    | 连接超时。                                    | Connection timed out                     |
-| EHOSTDOWN      | 112  | 是    | 找不到可用的server。server可能停止服务了，也可能正在退出中(返回了ELOGOFF)。 | "Fail to select server from …"  "Not connected to … yet" |
+| EHOSTDOWN      | 112  | 是    | 可能原因：一、Naming Server返回的列表不为空，但LB选不出可用的server，LB返回了EHOSTDOWN错误。具体可能原因：a.Server正在退出中(返回了ELOGOFF) b. Server因为之前的某种失败而被封禁，封禁的具体逻辑：1. 对于单连接，唯一的连接socket被SetFail即封禁，SetFail在代码里出现非常多，有很多种可能性触发 2. 对于连接池/短连接，只有错误号满足does_error_affect_main_socket时（ECONNREFUSED，ENETUNREACH，EHOSTUNREACH或EINVAL）才会封禁 3. 封禁之后，有CheckHealth线程健康检查，就是尝试去连接一下，检查间隔由SocketOptions的health_check_interval_s控制，检查正常会解封。二、使用SingleServer方式初始化Channel（没有LB），唯一的一个连接为LOGOFF或者封禁状态（同上） | "Fail to select server from …"  "Not connected to … yet" |
 | ENOSERVICE     | 1001 | 否    | 找不到服务，不太出现，一般会返回ENOMETHOD。               |                                          |
 | ENOMETHOD      | 1002 | 否    | 找不到方法。                                   | 形式广泛，常见如"Fail to find method=..."        |
 | EREQUEST       | 1003 | 否    | request序列化错误，client端和server端都可能设置        | 形式广泛："Missing required fields in request: …" "Fail to parse request message, …"  "Bad request" |
@@ -37,7 +38,7 @@ brpc中常见错误的打印内容列表如下：
 | ERPCTIMEDOUT   | 1008 | 否    | RPC超时                                    | "reached timeout=%dms"                   |
 | EFAILEDSOCKET  | 1009 | 是    | RPC进行过程中TCP连接出现问题                        | "The socket was SetFailed"               |
 | EHTTP          | 1010 | 否    | 非2xx状态码的HTTP访问结果均认为失败并被设置为这个错误码。默认不重试，可通过RetryPolicy定制 | Bad http call                            |
-| EOVERCROWDED   | 1011 | 是    | 连接上有过多的未发送数据，常由同时发起了过多的异步访问导致。可通过参数-socket_max_unwritten_bytes控制，默认8MB。 | The server is overcrowded                |
+| EOVERCROWDED   | 1011 | 是    | 连接上有过多的未发送数据，常由同时发起了过多的异步访问导致。可通过参数-socket_max_unwritten_bytes控制，默认64MB。 | The server is overcrowded                |
 | EINTERNAL      | 2001 | 否    | Server端Controller.SetFailed没有指定错误码时使用的默认错误码。 | "Internal Server Error"                  |
 | ERESPONSE      | 2002 | 否    | response解析错误，client端和server端都可能设置        | 形式广泛"Missing required fields in response: ...""Fail to parse response message, ""Bad response" |
 | ELOGOFF        | 2003 | 是    | Server已经被Stop了                           | "Server is going to quit"                |

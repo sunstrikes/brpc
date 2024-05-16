@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Rujie Jiang (jiangrujie@baidu.com)
 
 #ifndef BRPC_EVENT_DISPATCHER_H
 #define BRPC_EVENT_DISPATCHER_H
@@ -29,6 +30,7 @@ namespace brpc {
 // running in separate bthreads.
 class EventDispatcher {
 friend class Socket;
+friend class rdma::RdmaEndpoint;
 public:
     EventDispatcher();
     
@@ -62,12 +64,12 @@ public:
     // be used instead of EPOLL_CTL_ADD. When event arrives,
     // `Socket::HandleEpollOut' will be called with `socket_id'
     // Returns 0 on success, -1 otherwise and errno is set
-    int AddEpollOut(SocketId socket_id, int fd, bool pollin);
+    int RegisterEvent(SocketId socket_id, int fd, bool pollin);
     
     // Remove EPOLLOUT event on `fd'. If `pollin' is true, EPOLLIN event
     // will be kept and EPOLL_CTL_MOD will be used instead of EPOLL_CTL_DEL
     // Returns 0 on success, -1 otherwise and errno is set
-    int RemoveEpollOut(SocketId socket_id, int fd, bool pollin);
+    int UnregisterEvent(SocketId socket_id, int fd, bool pollin);
 
 private:
     DISALLOW_COPY_AND_ASSIGN(EventDispatcher);
@@ -97,7 +99,7 @@ private:
     int _wakeup_fds[2];
 };
 
-EventDispatcher& GetGlobalEventDispatcher(int fd);
+EventDispatcher& GetGlobalEventDispatcher(int fd, bthread_tag_t tag);
 
 } // namespace brpc
 

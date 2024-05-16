@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Aug  3 12:46:15 CST 2014
 
 #include <pthread.h>
@@ -41,13 +44,16 @@
 #include "bthread/log.h"
 
 extern "C" {
-extern void* _dl_sym(void* handle, const char* symbol, void* caller);
+extern void* __attribute__((weak)) _dl_sym(void* handle, const char* symbol, void* caller);
 }
+extern int __attribute__((weak)) GetStackTrace(void** result, int max_depth, int skip_count);
 
 namespace bthread {
 // Warm up backtrace before main().
 void* dummy_buf[4];
-const int ALLOW_UNUSED dummy_bt = backtrace(dummy_buf, arraysize(dummy_buf));
+const int ALLOW_UNUSED dummy_bt = GetStackTrace
+    ? GetStackTrace(dummy_buf, arraysize(dummy_buf), 0)
+    : backtrace(dummy_buf, arraysize(dummy_buf));
 
 // For controlling contentions collected per second.
 static bvar::CollectorSpeedLimit g_cp_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
@@ -61,24 +67,32 @@ struct SampledContention : public bvar::Collected {
     int64_t duration_ns;
     // number of samples, normalized according to to sampling_range
     double count;
-    int nframes;          // #elements in stack
     void* stack[26];      // backtrace.
+    int nframes;          // #elements in stack
 
     // Implement bvar::Collected
-    void dump_and_destroy(size_t round);
-    void destroy();
-    bvar::CollectorSpeedLimit* speed_limit() { return &g_cp_sl; }
+    void dump_and_destroy(size_t round) override;
+    void destroy() override;
+    bvar::CollectorSpeedLimit* speed_limit() override { return &g_cp_sl; }
 
-    // For combining samples with hashmap.
     size_t hash_code() const {
         if (nframes == 0) {
             return 0;
         }
-        uint32_t code = 1;
-        uint32_t seed = nframes;
-        butil::MurmurHash3_x86_32(stack, sizeof(void*) * nframes, seed, &code);
-        return code;
+        if (_hash_code == 0) {
+            _hash_code = 1;
+            uint32_t seed = nframes;
+            butil::MurmurHash3_x86_32(stack, sizeof(void*) * nframes, seed, &_hash_code);
+        }
+        return _hash_code;
     }
+private:
+friend butil::ObjectPool<SampledContention>;
+    SampledContention()
+        : duration_ns(0), count(0), stack{NULL}, nframes(0), _hash_code(0) {}
+    ~SampledContention() override = default;
+
+    mutable uint32_t _hash_code; // For combining samples with hashmap.
 };
 
 BAIDU_CASSERT(sizeof(SampledContention) == 256, be_friendly_to_allocator);
@@ -250,11 +264,11 @@ void ContentionProfiler::flush_to_disk(bool ending) {
 
 // If contention profiler is on, this variable will be set with a valid
 // instance. NULL otherwise.
-static ContentionProfiler* BAIDU_CACHELINE_ALIGNMENT g_cp = NULL;
+BAIDU_CACHELINE_ALIGNMENT static ContentionProfiler* g_cp = NULL;
 // Need this version to solve an issue that non-empty entries left by
 // previous contention profilers should be detected and overwritten.
 static uint64_t g_cp_version = 0;
-// Protecting accesss to g_cp.
+// Protecting accesses to g_cp.
 static pthread_mutex_t g_cp_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // The map storing information for profiling pthread_mutex. Different from
@@ -291,6 +305,7 @@ void SampledContention::dump_and_destroy(size_t /*round*/) {
 }
 
 void SampledContention::destroy() {
+    _hash_code = 0;
     butil::return_object(this);
 }
 
@@ -401,11 +416,24 @@ static pthread_once_t init_sys_mutex_lock_once = PTHREAD_ONCE_INIT;
 //   #23 0x00000000006fbb9a in tc_malloc ()
 // Call _dl_sym which is a private function in glibc to workaround the malloc
 // causing deadlock temporarily. This fix is hardly portable.
+
 static void init_sys_mutex_lock() {
+#if defined(OS_LINUX)
     // TODO: may need dlvsym when GLIBC has multiple versions of a same symbol.
     // http://blog.fesnel.com/blog/2009/08/25/preloading-with-multiple-symbol-versions
-    sys_pthread_mutex_lock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_lock", (void*)init_sys_mutex_lock);
-    sys_pthread_mutex_unlock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_unlock", (void*)init_sys_mutex_lock);
+    if (_dl_sym) {
+        sys_pthread_mutex_lock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_lock", (void*)init_sys_mutex_lock);
+        sys_pthread_mutex_unlock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_unlock", (void*)init_sys_mutex_lock);
+    } else {
+        // _dl_sym may be undefined reference in some system, fallback to dlsym
+        sys_pthread_mutex_lock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_lock");
+        sys_pthread_mutex_unlock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
+    }
+#elif defined(OS_MACOSX)
+    // TODO: look workaround for dlsym on mac
+    sys_pthread_mutex_lock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_lock");
+    sys_pthread_mutex_unlock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
+#endif
 }
 
 // Make sure pthread functions are ready before main().
@@ -496,14 +524,16 @@ inline bool remove_pthread_contention_site(
 // Submit the contention along with the callsite('s stacktrace)
 void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     tls_inside_lock = true;
-    SampledContention* sc = butil::get_object<SampledContention>();
+    auto sc = butil::get_object<SampledContention>();
     // Normalize duration_us and count so that they're addable in later
     // processings. Notice that sampling_range is adjusted periodically by
     // collecting thread.
     sc->duration_ns = csite.duration_ns * bvar::COLLECTOR_SAMPLING_BASE
         / csite.sampling_range;
     sc->count = bvar::COLLECTOR_SAMPLING_BASE / (double)csite.sampling_range;
-    sc->nframes = backtrace(sc->stack, arraysize(sc->stack)); // may lock
+    sc->nframes = GetStackTrace
+        ? GetStackTrace(sc->stack, arraysize(sc->stack), 0)
+        : backtrace(sc->stack, arraysize(sc->stack)); // may lock
     sc->submit(now_ns / 1000);  // may lock
     tls_inside_lock = false;
 }
@@ -624,7 +654,7 @@ inline int mutex_lock_contended(bthread_mutex_t* m) {
     while (whole->exchange(BTHREAD_MUTEX_CONTENDED) & BTHREAD_MUTEX_LOCKED) {
         if (bthread::butex_wait(whole, BTHREAD_MUTEX_CONTENDED, NULL) < 0 &&
             errno != EWOULDBLOCK && errno != EINTR/*note*/) {
-            // a mutex lock should ignore interrruptions in general since
+            // a mutex lock should ignore interruptions in general since
             // user code is unlikely to check the return value.
             return errno;
         }

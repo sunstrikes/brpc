@@ -1,18 +1,20 @@
-// Copyright (c) 2013 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Wed Nov 27 12:59:20 CST 2013
 
 // This closed addressing hash-map puts first linked node in bucket array
@@ -94,6 +96,7 @@
 #include <stdint.h>
 #include <functional>
 #include <iostream>                               // std::ostream
+#include <type_traits>                            // std::aligned_storage
 #include "butil/type_traits.h"
 #include "butil/logging.h"
 #include "butil/find_cstr.h"
@@ -124,11 +127,13 @@ template <typename _K, typename _T,
           // Test equivalence between stored-key and passed-key.
           // stored-key is always on LHS, passed-key is always on RHS.
           typename _Equal = DefaultEqualTo<_K>,
-          bool _Sparse = false>
+          bool _Sparse = false,
+          typename _Alloc = PtAllocator>
 class FlatMap {
 public:
     typedef _K key_type;
     typedef _T mapped_type;
+    typedef _Alloc allocator_type;
     typedef FlatMapElement<_K, _T> Element;
     typedef typename Element::value_type value_type;
     typedef typename conditional<
@@ -146,10 +151,12 @@ public:
         key_type key;
     };
     
-    FlatMap(const hasher& hashfn = hasher(), const key_equal& eql = key_equal());
+    explicit FlatMap(const hasher& hashfn = hasher(),
+                     const key_equal& eql = key_equal(),
+                     const allocator_type& alloc = allocator_type());
     ~FlatMap();
-    FlatMap(const FlatMap& rhs);    
-    void operator=(const FlatMap& rhs);
+    FlatMap(const FlatMap& rhs);
+    FlatMap& operator=(const FlatMap& rhs);
     void swap(FlatMap & rhs);
 
     // Must be called to initialize this map, otherwise insert/operator[]
@@ -165,10 +172,16 @@ public:
     // Returns address of the inserted value, NULL on error.
     mapped_type* insert(const key_type& key, const mapped_type& value);
 
+    // Insert a pair of {key, value}. If size()*100/bucket_count() is
+    // more than load_factor(), a resize() will be done.
+    // Returns address of the inserted value, NULL on error.
+    mapped_type* insert(const std::pair<key_type, mapped_type>& kv);
+
     // Remove |key| and the associated value
     // Returns: 1 on erased, 0 otherwise.
-    template <typename K2> size_t erase(const K2& key);
-    
+    template <typename K2>
+    size_t erase(const K2& key, mapped_type* old_value = NULL);
+
     // Remove all items. Allocated spaces are NOT returned by system.
     void clear();
 
@@ -239,27 +252,30 @@ public:
 
     struct Bucket {
         explicit Bucket(const _K& k) : next(NULL)
-        { new (element_spaces) Element(k); }
+        { new (&element_spaces) Element(k); }
         Bucket(const Bucket& other) : next(NULL)
-        { new (element_spaces) Element(other.element()); }
+        { new (&element_spaces) Element(other.element()); }
         bool is_valid() const { return next != (const Bucket*)-1UL; }
         void set_invalid() { next = (Bucket*)-1UL; }
-        // NOTE: Only be called when in_valid() is true.
+        // NOTE: Only be called when is_valid() is true.
         Element& element() {
-            void* spaces = element_spaces; // Suppress strict-aliasing
+            void* spaces = &element_spaces; // Suppress strict-aliasing
             return *reinterpret_cast<Element*>(spaces);
         }
         const Element& element() const {
-            const void* spaces = element_spaces;
+            const void* spaces = &element_spaces;
             return *reinterpret_cast<const Element*>(spaces);
         }
-        Bucket* next;
-        char element_spaces[sizeof(Element)];
+        Bucket *next;
+        typename std::aligned_storage<sizeof(Element), alignof(Element)>::type
+            element_spaces;
     };
+
+    allocator_type& get_allocator() { return _pool.get_allocator(); }
 
 private:
 template <typename _Map, typename _Element> friend class FlatMapIterator;
-template <typename _Map, typename _Element> friend class FlatMapSparseIterator;
+template <typename _Map, typename _Element> friend class SparseFlatMapIterator;
     // True if buckets need to be resized before holding `size' elements.
     inline bool is_too_crowded(size_t size) const
     { return size * 100 >= _nbucket * _load_factor; }
@@ -271,16 +287,17 @@ template <typename _Map, typename _Element> friend class FlatMapSparseIterator;
     u_int _load_factor;
     hasher _hashfn;
     key_equal _eql;
-    SingleThreadedPool<sizeof(Bucket), 1024, 16> _pool;
+    SingleThreadedPool<sizeof(Bucket), 1024, 16, allocator_type> _pool;
 };
 
 template <typename _K,
           typename _Hash = DefaultHasher<_K>,
           typename _Equal = DefaultEqualTo<_K>,
-          bool _Sparse = false>
+          bool _Sparse = false,
+          typename _Alloc = PtAllocator>
 class FlatSet {
 public:
-    typedef FlatMap<_K, FlatMapVoid, _Hash, _Equal, _Sparse> Map;
+    typedef FlatMap<_K, FlatMapVoid, _Hash, _Equal, _Sparse, _Alloc> Map;
     typedef typename Map::key_type key_type;
     typedef typename Map::value_type value_type;
     typedef typename Map::Bucket Bucket;
@@ -288,9 +305,12 @@ public:
     typedef typename Map::const_iterator const_iterator;
     typedef typename Map::hasher hasher;
     typedef typename Map::key_equal key_equal;
+    typedef typename Map::allocator_type allocator_type;
     
-    FlatSet(const hasher& hashfn = hasher(), const key_equal& eql = key_equal())
-        : _map(hashfn, eql) {}
+    explicit FlatSet(const hasher& hashfn = hasher(),
+                     const key_equal& eql = key_equal(),
+                     const allocator_type& alloc = allocator_type())
+        : _map(hashfn, eql, alloc) {}
     void swap(FlatSet & rhs) { _map.swap(rhs._map); }
 
     int init(size_t nbucket, u_int load_factor = 80)
@@ -300,7 +320,7 @@ public:
     { return _map.insert(key, FlatMapVoid()); }
 
     template <typename K2>
-    size_t erase(const K2& key) { return _map.erase(key); }
+    size_t erase(const K2& key) { return _map.erase(key, NULL); }
 
     void clear() { return _map.clear(); }
     void clear_and_reset_pool() { return _map.clear_and_reset_pool(); }
@@ -353,11 +373,15 @@ public:
     //                                             ^^^^^^^^^^^
     const K& first_ref() const { return _key; }
     T& second_ref() { return _value; }
+    T&& second_movable_ref() { return std::move(_value); }
     value_type& value_ref() { return *reinterpret_cast<value_type*>(this); }
     inline static const K& first_ref_from_value(const value_type& v)
     { return v.first; }
     inline static const T& second_ref_from_value(const value_type& v)
     { return v.second; }
+    inline static T&& second_movable_ref_from_value(value_type& v)
+    { return std::move(v.second); }
+
 private:
     const K _key;
     T _value;
@@ -370,11 +394,15 @@ public:
     explicit FlatMapElement(const K& k) : _key(k) {}
     const K& first_ref() const { return _key; }
     FlatMapVoid& second_ref() { return second_ref_from_value(_key); }
+    FlatMapVoid& second_movable_ref() { return second_ref(); }
     value_type& value_ref() { return _key; }
     inline static const K& first_ref_from_value(value_type& v) { return v; }
     inline static FlatMapVoid& second_ref_from_value(value_type&) {
         static FlatMapVoid dummy;
         return dummy;
+    }
+    inline static const FlatMapVoid& second_movable_ref_from_value(value_type& v) {
+        return second_ref_from_value(v);
     }
 private:
     K _key;

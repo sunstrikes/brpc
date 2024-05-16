@@ -1,21 +1,27 @@
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: 2012-10-08 23:53:50
 
 #include "butil/logging.h"
+
+#include <gflags/gflags.h>
+DEFINE_bool(log_as_json, false, "Print log as a valid JSON");
+DEFINE_bool(escape_log, false, "Escape log content before printing");
 
 #if !BRPC_WITH_GLOG
 
@@ -67,8 +73,11 @@ typedef pthread_mutex_t* MutexHandle;
 #include "butil/strings/string_util.h"
 #include "butil/strings/stringprintf.h"
 #include "butil/strings/utf_string_conversions.h"
-#include "butil/synchronization/lock.h"
+#include "butil/synchronization/condition_variable.h"
 #include "butil/threading/platform_thread.h"
+#include "butil/threading/simple_thread.h"
+#include "butil/object_pool.h"
+
 #if defined(OS_POSIX)
 #include "butil/errno.h"
 #include "butil/fd_guard.h"
@@ -85,7 +94,6 @@ typedef pthread_mutex_t* MutexHandle;
 #include <vector>
 #include <deque>
 #include <limits>
-#include <gflags/gflags.h>
 #include "butil/atomicops.h"
 #include "butil/thread_local.h"
 #include "butil/scoped_lock.h"                        // BAIDU_SCOPED_LOCK
@@ -125,7 +133,9 @@ DEFINE_string(vmodule, "", "per-module verbose level."
               " (that is, name ignoring .cpp/.h)."
               " LOG_LEVEL overrides any value given by --v.");
 
-DEFINE_bool(log_process_id, false, "Log process id");
+DEFINE_bool(log_pid, false, "Log process id");
+
+DEFINE_bool(log_bid, true, "Log bthread id");
 
 DEFINE_int32(minloglevel, 0, "Any log at or above this level will be "
              "displayed. Anything below this level will be silently ignored. "
@@ -136,6 +146,19 @@ DEFINE_bool(log_hostname, false, "Add host after pid in each log so"
             " like ELK.");
 
 DEFINE_bool(log_year, false, "Log year in datetime part in each log");
+
+DEFINE_bool(log_func_name, false, "Log function name in each log");
+
+DEFINE_bool(async_log, false, "Use async log");
+
+DEFINE_bool(async_log_in_background_always, false, "Async log written in background always.");
+
+DEFINE_int32(max_async_log_queue_size, 100000, "Max async log size. "
+             "If current log count of async log > max_async_log_size, "
+             "Use sync log to protect process.");
+
+DEFINE_int32(sleep_to_flush_async_log_s, 0,
+             "If the value > 0, sleep before atexit to flush async log");
 
 namespace {
 
@@ -239,7 +262,7 @@ public:
         UnlockLogging();
     }
 
-    static void Init(LogLockingState lock_log, const PathChar* new_log_file) {
+    static void Init(LogLockingState lock_log, const LogChar* new_log_file) {
         if (initialized)
             return;
         lock_log_file = lock_log;
@@ -392,7 +415,299 @@ void CloseLogFileUnlocked() {
     log_file = NULL;
 }
 
+void Log2File(const std::string& log) {
+    // We can have multiple threads and/or processes, so try to prevent them
+    // from clobbering each other's writes.
+    // If the client app did not call InitLogging, and the lock has not
+    // been created do it now. We do this on demand, but if two threads try
+    // to do this at the same time, there will be a race condition to create
+    // the lock. This is why InitLogging should be called from the main
+    // thread at the beginning of execution.
+    LoggingLock::Init(LOCK_LOG_FILE, NULL);
+    LoggingLock logging_lock;
+    if (InitializeLogFileHandle()) {
+#if defined(OS_WIN)
+        SetFilePointer(log_file, 0, 0, SEEK_END);
+                DWORD num_written;
+                WriteFile(log_file,
+                          static_cast<const void*>(log.data()),
+                          static_cast<DWORD>(log.size()),
+                          &num_written,
+                          NULL);
+#else
+        fwrite(log.data(), log.size(), 1, log_file);
+        fflush(log_file);
+#endif
+    }
+}
+
 }  // namespace
+
+struct BAIDU_CACHELINE_ALIGNMENT LogRequest {
+    static LogRequest* const UNCONNECTED;
+
+    LogRequest* next{NULL};
+    std::string data;
+};
+
+LogRequest* const LogRequest::UNCONNECTED = (LogRequest*)(intptr_t)-1;
+
+class AsyncLogger : public butil::SimpleThread {
+public:
+    static AsyncLogger* GetInstance();
+
+    void Log(const std::string& log);
+    void Log(std::string&& log);
+    void StopAndJoin();
+
+private:
+friend struct DefaultSingletonTraits<AsyncLogger>;
+
+    static LogRequest _stop_req;
+
+    AsyncLogger();
+    ~AsyncLogger() override;
+
+    static void AtExit() {
+        GetInstance()->StopAndJoin();
+        if (FLAGS_sleep_to_flush_async_log_s > 0) {
+            ::sleep(FLAGS_sleep_to_flush_async_log_s);
+        }
+    }
+
+    void LogImpl(LogRequest* log_req);
+
+    void Run() override;
+
+    void LogTask(LogRequest* req);
+
+    bool IsLogComplete(LogRequest* old_head);
+
+    void DoLog(LogRequest* req);
+    void DoLog(const std::string& log);
+
+    butil::atomic<LogRequest*> _log_head;
+    butil::Mutex _mutex;
+    butil::ConditionVariable _cond;
+    LogRequest* _current_log_request;
+    butil::atomic<int32_t> _log_request_count;
+    butil::atomic<bool> _stop;
+};
+
+AsyncLogger* AsyncLogger::GetInstance() {
+    return Singleton<AsyncLogger,
+                     LeakySingletonTraits<AsyncLogger>>::get();
+}
+
+AsyncLogger::AsyncLogger()
+    : butil::SimpleThread("async_log_thread")
+    , _log_head(NULL)
+    , _cond(&_mutex)
+    , _current_log_request(NULL)
+    , _stop(false) {
+    Start();
+    // We need to stop async logger and
+    // flush all async log before exit.
+    atexit(AtExit);
+}
+
+AsyncLogger::~AsyncLogger() {
+    StopAndJoin();
+}
+
+void AsyncLogger::Log(const std::string& log) {
+    if (log.empty()) {
+        return;
+    }
+
+    bool is_full = FLAGS_max_async_log_queue_size > 0 &&
+        _log_request_count.fetch_add(1, butil::memory_order_relaxed) >
+        FLAGS_max_async_log_queue_size;
+    if (is_full || _stop.load(butil::memory_order_relaxed)) {
+        // Async logger is full or stopped, fallback to sync log.
+        DoLog(log);
+        return;
+    }
+
+    auto log_req = butil::get_object<LogRequest>();
+    if (!log_req) {
+        // Async log failed, fallback to sync log.
+        DoLog(log);
+        return;
+    }
+    log_req->data = log;
+    LogImpl(log_req);
+}
+
+void AsyncLogger::Log(std::string&& log) {
+    if (log.empty()) {
+        return;
+    }
+
+    bool is_full = FLAGS_max_async_log_queue_size > 0 &&
+        _log_request_count.fetch_add(1, butil::memory_order_relaxed) >
+        FLAGS_max_async_log_queue_size;
+    if (is_full || _stop.load(butil::memory_order_relaxed)) {
+        // Async logger is full or stopped, fallback to sync log.
+        DoLog(log);
+        return;
+    }
+
+    auto log_req = butil::get_object<LogRequest>();
+    if (!log_req) {
+        // Async log failed, fallback to sync log.
+        DoLog(log);
+        return;
+    }
+    log_req->data = std::move(log);
+    LogImpl(log_req);
+}
+
+void AsyncLogger::LogImpl(LogRequest* log_req) {
+    log_req->next = LogRequest::UNCONNECTED;
+    // Release fence makes sure the thread getting request sees *req
+    LogRequest* const prev_head =
+        _log_head.exchange(log_req, butil::memory_order_release);
+    if (prev_head != NULL) {
+        // Someone is logging. The async_log_thread thread may spin
+        // until req->next to be non-UNCONNECTED. This process is not
+        // lock-free, but the duration is so short(1~2 instructions,
+        // depending on compiler) that the spin rarely occurs in practice
+        // (I've not seen any spin in highly contended tests).
+        log_req->next = prev_head;
+        return;
+    }
+    // We've got the right to write.
+    log_req->next = NULL;
+
+    if (!FLAGS_async_log_in_background_always) {
+        // Use sync log for the LogRequest
+        // which has got the right to write.
+        DoLog(log_req);
+        // Return when there's no more LogRequests.
+        if (IsLogComplete(log_req)) {
+            butil::return_object(log_req);
+            return;
+        }
+    }
+
+    BAIDU_SCOPED_LOCK(_mutex);
+    if (_stop.load(butil::memory_order_relaxed)) {
+        // Async logger is stopped, fallback to sync log.
+        LogTask(log_req);
+    } else {
+        // Wake up async logger.
+        _current_log_request = log_req;
+        _cond.Signal();
+    }
+}
+
+void AsyncLogger::StopAndJoin() {
+    if (!_stop.exchange(true, butil::memory_order_relaxed)) {
+        BAIDU_SCOPED_LOCK(_mutex);
+        _cond.Signal();
+    }
+    if (!HasBeenJoined()) {
+        Join();
+    }
+}
+
+void AsyncLogger::Run() {
+    while (true) {
+        BAIDU_SCOPED_LOCK(_mutex);
+        while (!_stop.load(butil::memory_order_relaxed) &&
+               !_current_log_request) {
+            _cond.Wait();
+        }
+        if (_stop.load(butil::memory_order_relaxed) &&
+            !_current_log_request) {
+            break;
+        }
+
+        LogTask(_current_log_request);
+        _current_log_request = NULL;
+    }
+}
+
+void AsyncLogger::LogTask(LogRequest* req) {
+    do {
+        // req was logged, skip it.
+        if (req->next != NULL && req->data.empty()) {
+            LogRequest* const saved_req = req;
+            req = req->next;
+            butil::return_object(saved_req);
+        }
+
+        // Log all requests to file.
+        while (req->next != NULL) {
+            LogRequest* const saved_req = req;
+            req = req->next;
+            if (!saved_req->data.empty()) {
+                DoLog(saved_req);
+            }
+            // Release LogRequests until last request.
+            butil::return_object(saved_req);
+        }
+        if (!req->data.empty()) {
+            DoLog(req);
+        }
+
+        // Return when there's no more LogRequests.
+        if (IsLogComplete(req)) {
+            butil::return_object(req);
+            return;
+        }
+    } while (true);
+}
+
+bool AsyncLogger::IsLogComplete(LogRequest* old_head) {
+    if (old_head->next) {
+        fprintf(stderr, "old_head->next should be NULL\n");
+    }
+    LogRequest* new_head = old_head;
+    LogRequest* desired = NULL;
+    if (_log_head.compare_exchange_strong(
+        new_head, desired, butil::memory_order_acquire)) {
+        // No one added new requests.
+        return true;
+    }
+    if (new_head == old_head) {
+        fprintf(stderr, "new_head should not be equal to old_head\n");
+    }
+    // Above acquire fence pairs release fence of exchange in Log() to make
+    // sure that we see all fields of requests set.
+
+    // Someone added new requests.
+    // Reverse the list until old_head.
+    LogRequest* tail = NULL;
+    LogRequest* p = new_head;
+    do {
+        while (p->next == LogRequest::UNCONNECTED) {
+            sched_yield();
+        }
+        LogRequest* const saved_next = p->next;
+        p->next = tail;
+        tail = p;
+        p = saved_next;
+        if (!p) {
+            fprintf(stderr, "p should not be NULL\n");
+        }
+    } while (p != old_head);
+
+    // Link old list with new list.
+    old_head->next = tail;
+    return false;
+}
+
+void AsyncLogger::DoLog(LogRequest* req) {
+    DoLog(req->data);
+    req->data.clear();
+}
+
+void AsyncLogger::DoLog(const std::string& log) {
+    Log2File(log);
+    _log_request_count.fetch_sub(1);
+}
 
 LoggingSettings::LoggingSettings()
     : logging_dest(LOG_DEFAULT),
@@ -451,7 +766,7 @@ void SetLogAssertHandler(LogAssertHandler handler) {
 const char* const log_severity_names[LOG_NUM_SEVERITIES] = {
     "INFO", "NOTICE", "WARNING", "ERROR", "FATAL" };
 
-inline void log_severity_name(std::ostream& os, int severity) {
+static void PrintLogSeverity(std::ostream& os, int severity) {
     if (severity < 0) {
         // Add extra space to separate from following datetime.
         os << 'V' << -severity << ' ';
@@ -462,9 +777,78 @@ inline void log_severity_name(std::ostream& os, int severity) {
     }
 }
 
-void print_log_prefix(std::ostream& os,
-                      int severity, const char* file, int line) {
-    log_severity_name(os, severity);
+void PrintLogPrefix(std::ostream& os, int severity,
+                    const char* file, int line,
+                    const char* func) {
+    PrintLogSeverity(os, severity);
+#if defined(OS_LINUX) || defined(OS_MACOSX)
+    timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t t = tv.tv_sec;
+#else
+    time_t t = time(NULL);
+#endif
+    struct tm local_tm = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL};
+#if _MSC_VER >= 1400
+    localtime_s(&local_tm, &t);
+#else
+    localtime_r(&t, &local_tm);
+#endif
+    const char prev_fill = os.fill('0');
+    if (FLAGS_log_year) {
+        os << std::setw(4) << local_tm.tm_year + 1900;
+    }
+    os << std::setw(2) << local_tm.tm_mon + 1
+       << std::setw(2) << local_tm.tm_mday << ' '
+       << std::setw(2) << local_tm.tm_hour << ':'
+       << std::setw(2) << local_tm.tm_min << ':'
+       << std::setw(2) << local_tm.tm_sec;
+#if defined(OS_LINUX) || defined(OS_MACOSX)
+    os << '.' << std::setw(6) << tv.tv_usec;
+#endif
+    if (FLAGS_log_pid) {
+        os << ' ' << std::setfill(' ') << std::setw(5) << CurrentProcessId();
+    }
+    os << ' ' << std::setfill(' ') << std::setw(5)
+       << butil::PlatformThread::CurrentId() << std::setfill('0');
+    if (FLAGS_log_bid && bthread_self) {
+        os << ' ' << std::setfill(' ') << std::setw(5) << bthread_self();
+    }
+    if (FLAGS_log_hostname) {
+        butil::StringPiece hostname(butil::my_hostname());
+        if (hostname.ends_with(".baidu.com")) { // make it shorter
+            hostname.remove_suffix(10);
+        }
+        os << ' ' << hostname;
+    }
+    os << ' ' << file << ':' << line;
+    if (func && *func != '\0') {
+        os << " " << func;
+    }
+    os << "] ";
+
+    os.fill(prev_fill);
+}
+
+void PrintLogPrefix(std::ostream& os, int severity,
+                    const char* file, int line) {
+    PrintLogPrefix(os, severity, file, line, "");
+}
+
+static void PrintLogPrefixAsJSON(std::ostream& os, int severity,
+                                 const char* file, const char* func,
+                                 int line) {
+    // severity
+    os << "\"L\":\"";
+    if (severity < 0) {
+        os << 'V' << -severity;
+    } else if (severity < LOG_NUM_SEVERITIES) {
+        os << log_severity_names[severity][0];
+    } else {
+        os << 'U';
+    }
+    // time
+    os << "\",\"T\":\"";
 #if defined(OS_LINUX)
     timeval tv;
     gettimeofday(&tv, NULL);
@@ -490,20 +874,82 @@ void print_log_prefix(std::ostream& os,
 #if defined(OS_LINUX)
     os << '.' << std::setw(6) << tv.tv_usec;
 #endif
-    if (FLAGS_log_process_id) {
-        os << ' ' << std::setfill(' ') << std::setw(5) << CurrentProcessId();
+    os << "\",";
+    os.fill(prev_fill);
+
+    if (FLAGS_log_pid) {
+        os << "\"pid\":\"" << CurrentProcessId() << "\",";
     }
-    os << ' ' << std::setfill(' ') << std::setw(5)
-       << butil::PlatformThread::CurrentId() << std::setfill('0');
+    os << "\"tid\":\"" << butil::PlatformThread::CurrentId() << "\",";
     if (FLAGS_log_hostname) {
         butil::StringPiece hostname(butil::my_hostname());
         if (hostname.ends_with(".baidu.com")) { // make it shorter
             hostname.remove_suffix(10);
         }
-        os << ' ' << hostname;
+        os << "\"host\":\"" << hostname << "\",";
     }
-    os << ' ' << file << ':' << line << "] ";
-    os.fill(prev_fill);
+    os << "\"C\":\"" << file << ':' << line;
+    if (func && *func != '\0') {
+        os << " " << func;
+    }
+    os << "\"";
+}
+
+void EscapeJson(std::ostream& os, const butil::StringPiece& s) {
+    for (auto it = s.begin(); it != s.end(); it++) {
+        auto c = *it;
+        switch (c) {
+        case '"': os << "\\\""; break;
+        case '\\': os << "\\\\"; break;
+        case '\b': os << "\\b"; break;
+        case '\f': os << "\\f"; break;
+        case '\n': os << "\\n"; break;
+        case '\r': os << "\\r"; break;
+        case '\t': os << "\\t"; break;
+        default: os << c;
+        }
+    }
+}
+
+inline void OutputLog(std::ostream& os, const butil::StringPiece& s) {
+    if (FLAGS_escape_log) {
+        EscapeJson(os, s);
+    } else {
+        os.write(s.data(), s.length());
+    }
+}
+
+void PrintLog(std::ostream& os, int severity, const char* file, int line,
+              const char* func, const butil::StringPiece& content) {
+    if (!FLAGS_log_as_json) {
+        PrintLogPrefix(os, severity, file, line, func);
+        OutputLog(os, content);
+    } else {
+        os << '{';
+        PrintLogPrefixAsJSON(os, severity, file, func, line);
+        bool pair_quote = false;
+        if (content.empty() || content[0] != '"') {
+            // not a json, add a 'M' field
+            os << ",\"M\":\"";
+            pair_quote = true;
+        } else {
+            os << ',';
+        }
+        OutputLog(os, content);
+        if (pair_quote) {
+            os << '"';
+        } else if (!content.empty() && content[content.size() -1 ] != '"') {
+            // Controller may write `"M":"...` which misses the last quote
+            os << '"';
+        }
+        os << '}';
+    }
+}
+
+void PrintLog(std::ostream& os,
+              int severity, const char* file, int line,
+              const butil::StringPiece& content) {
+    PrintLog(os, severity, file, line, "", content);
 }
 
 // A log message handler that gets notified of every log message we process.
@@ -607,16 +1053,20 @@ void DisplayDebugMessageInDialog(const std::string& str) {
 #endif  // !defined(NDEBUG)
 
 
-bool StringSink::OnLogMessage(int severity, const char* file, int line, 
+bool StringSink::OnLogMessage(int severity, const char* file, int line,
                               const butil::StringPiece& content) {
-    std::ostringstream prefix_os;
-    print_log_prefix(prefix_os, severity, file, line);
-    const std::string prefix = prefix_os.str();
+    return OnLogMessage(severity, file, line, "", content);
+}
+
+bool StringSink::OnLogMessage(int severity, const char* file,
+                              int line, const char* func,
+                              const butil::StringPiece& content) {
+    std::ostringstream os;
+    PrintLog(os, severity, file, line, func, content);
+    const std::string msg = os.str();
     {
         butil::AutoLock lock_guard(_lock);
-        reserve(size() + prefix.size() + content.size());
-        append(prefix);
-        append(content.data(), content.size());
+        append(msg);
     }
     return true;
 }
@@ -655,10 +1105,20 @@ void CharArrayStreamBuf::reset() {
     setp(_data, _data + _size);
 }
 
-LogStream& LogStream::SetPosition(const PathChar* file, int line,
+LogStream& LogStream::SetPosition(const LogChar* file, int line,
                                   LogSeverity severity) {
     _file = file;
     _line = line;
+    _severity = severity;
+    return *this;
+}
+
+LogStream& LogStream::SetPosition(const LogChar* file, int line,
+                                  const LogChar* func,
+                                  LogSeverity severity) {
+    _file = file;
+    _line = line;
+    _func = func;
     _severity = severity;
     return *this;
 }
@@ -716,7 +1176,9 @@ static LogStream** get_or_new_tls_stream_array() {
     return a;
 }
 
-inline LogStream* CreateLogStream(const PathChar* file, int line,
+inline LogStream* CreateLogStream(const LogChar* file,
+                                  int line,
+                                  const LogChar* func,
                                   LogSeverity severity) {
     int slot = 0;
     if (severity >= 0) {
@@ -730,9 +1192,15 @@ inline LogStream* CreateLogStream(const PathChar* file, int line,
         stream_array[slot] = stream;
     }
     if (stream->empty()) {
-        stream->SetPosition(file, line, severity);
+        stream->SetPosition(file, line, func, severity);
     }
     return stream;
+}
+
+inline LogStream* CreateLogStream(const LogChar* file,
+                                  int line,
+                                  LogSeverity severity) {
+    return CreateLogStream(file, line, "", severity);
 }
 
 inline void DestroyLogStream(LogStream* stream) {
@@ -743,10 +1211,17 @@ inline void DestroyLogStream(LogStream* stream) {
 
 #else
 
-inline LogStream* CreateLogStream(const PathChar* file, int line,
+inline LogStream* CreateLogStream(const LogChar* file, int line,
+                                  LogSeverity severity) {
+    return CreateLogStream(file, line, "", severity);
+}
+
+
+inline LogStream* CreateLogStream(const LogChar* file, int line,
+                                  const LogChar* func,
                                   LogSeverity severity) {
     LogStream* stream = new LogStream;
-    stream->SetPosition(file, line, severity);
+    stream->SetPosition(file, line, func, severity);
     return stream;
 }
 
@@ -764,14 +1239,19 @@ public:
     }
 
     bool OnLogMessage(int severity, const char* file, int line,
-                      const butil::StringPiece& content) {
+                      const butil::StringPiece& content) override {
+        return OnLogMessage(severity, file, line, "", content);
+    }
+
+    bool OnLogMessage(int severity, const char* file,
+                      int line, const char* func,
+                      const butil::StringPiece& content) override {
         // There's a copy here to concatenate prefix and content. Since
         // DefaultLogSink is hardly used right now, the copy is irrelevant.
         // A LogSink focused on performance should also be able to handle
         // non-continuous inputs which is a must to maximize performance.
         std::ostringstream os;
-        print_log_prefix(os, severity, file, line);
-        os.write(content.data(), content.size());
+        PrintLog(os, severity, file, line, func, content);
         os << '\n';
         std::string log = os.str();
         
@@ -788,35 +1268,18 @@ public:
 
         // write to log file
         if ((logging_destination & LOG_TO_FILE) != 0) {
-            // We can have multiple threads and/or processes, so try to prevent them
-            // from clobbering each other's writes.
-            // If the client app did not call InitLogging, and the lock has not
-            // been created do it now. We do this on demand, but if two threads try
-            // to do this at the same time, there will be a race condition to create
-            // the lock. This is why InitLogging should be called from the main
-            // thread at the beginning of execution.
-            LoggingLock::Init(LOCK_LOG_FILE, NULL);
-            LoggingLock logging_lock;
-            if (InitializeLogFileHandle()) {
-#if defined(OS_WIN)
-                SetFilePointer(log_file, 0, 0, SEEK_END);
-                DWORD num_written;
-                WriteFile(log_file,
-                          static_cast<const void*>(log.data()),
-                          static_cast<DWORD>(log.size()),
-                          &num_written,
-                          NULL);
-#else
-                fwrite(log.data(), log.size(), 1, log_file);
-                fflush(log_file);
-#endif
+            if ((FLAGS_crash_on_fatal_log && severity == BLOG_FATAL) ||
+                !FLAGS_async_log) {
+                Log2File(log);
+            } else {
+                AsyncLogger::GetInstance()->Log(std::move(log));
             }
         }
         return true;
     }
 private:
-    DefaultLogSink() {}
-    ~DefaultLogSink() {}
+    DefaultLogSink() = default;
+    ~DefaultLogSink() override = default;
 friend struct DefaultSingletonTraits<DefaultLogSink>;
 };
 
@@ -862,7 +1325,15 @@ void LogStream::FlushWithoutReset() {
         DoublyBufferedLogSink::ScopedPtr ptr;
         if (DoublyBufferedLogSink::GetInstance()->Read(&ptr) == 0 &&
             (*ptr) != NULL) {
-            if ((*ptr)->OnLogMessage(_severity, _file, _line, content())) {
+            bool result = false;
+            if (FLAGS_log_func_name) {
+                result = (*ptr)->OnLogMessage(_severity, _file, _line,
+                                              _func, content());
+            } else {
+                result = (*ptr)->OnLogMessage(_severity, _file,
+                                              _line, content());
+            }
+            if (result) {
                 goto FINISH_LOGGING;
             }
 #ifdef BAIDU_INTERNAL
@@ -875,14 +1346,19 @@ void LogStream::FlushWithoutReset() {
 #ifdef BAIDU_INTERNAL
     if (!tried_comlog) {
         if (ComlogSink::GetInstance()->OnLogMessage(
-                _severity, _file, _line, content())) {
+                _severity, _file, _line, _func, content())) {
             goto FINISH_LOGGING;
         }
     }
 #endif
     if (!tried_default) {
-        DefaultLogSink::GetInstance()->OnLogMessage(
-            _severity, _file, _line, content());
+        if (FLAGS_log_func_name) {
+            DefaultLogSink::GetInstance()->OnLogMessage(
+                _severity, _file, _line, _func, content());
+        } else {
+            DefaultLogSink::GetInstance()->OnLogMessage(
+                _severity, _file, _line, content());
+        }
     }
 
 FINISH_LOGGING:
@@ -912,19 +1388,31 @@ FINISH_LOGGING:
     }
 }
 
-LogMessage::LogMessage(const char* file, int line, LogSeverity severity) {
-    _stream = CreateLogStream(file, line, severity);
+LogMessage::LogMessage(const char* file, int line, LogSeverity severity)
+    : LogMessage(file, line, "", severity) {}
+
+LogMessage::LogMessage(const char* file, int line,
+                       const char* func, LogSeverity severity) {
+    _stream = CreateLogStream(file, line, func, severity);
 }
 
-LogMessage::LogMessage(const char* file, int line, std::string* result) {
-    _stream = CreateLogStream(file, line, BLOG_FATAL);
+LogMessage::LogMessage(const char* file, int line, std::string* result)
+    : LogMessage(file, line, "", result) {}
+
+LogMessage::LogMessage(const char* file, int line,
+                       const char* func, std::string* result) {
+    _stream = CreateLogStream(file, line, func, BLOG_FATAL);
     *_stream << "Check failed: " << *result;
     delete result;
 }
 
 LogMessage::LogMessage(const char* file, int line, LogSeverity severity,
-                       std::string* result) {
-    _stream = CreateLogStream(file, line, severity);
+                       std::string* result)
+   : LogMessage(file, line, "", severity, result) {}
+
+LogMessage::LogMessage(const char* file, int line, const char* func,
+                       LogSeverity severity, std::string* result) {
+    _stream = CreateLogStream(file, line, func, severity);
     *_stream << "Check failed: " << *result;
     delete result;
 }
@@ -989,8 +1477,16 @@ Win32ErrorLogMessage::Win32ErrorLogMessage(const char* file,
                                            int line,
                                            LogSeverity severity,
                                            SystemErrorCode err)
-    : err_(err),
-      log_message_(file, line, severity) {
+   : Win32ErrorLogMessage(file, line, "", severity, err) {
+}
+
+Win32ErrorLogMessage::Win32ErrorLogMessage(const char* file,
+                                           int line,
+                                           const char* func,
+                                           LogSeverity severity,
+                                           SystemErrorCode err)
+    : err_(err)
+    , log_message_(file, line, func, severity) {
 }
 
 Win32ErrorLogMessage::~Win32ErrorLogMessage() {
@@ -1005,9 +1501,15 @@ ErrnoLogMessage::ErrnoLogMessage(const char* file,
                                  int line,
                                  LogSeverity severity,
                                  SystemErrorCode err)
-    : err_(err),
-      log_message_(file, line, severity) {
-}
+    : ErrnoLogMessage(file, line, "", severity, err) {}
+
+ErrnoLogMessage::ErrnoLogMessage(const char* file,
+                                 int line,
+                                 const char* func,
+                                 LogSeverity severity,
+                                 SystemErrorCode err)
+    : err_(err)
+    , log_message_(file, line, func, severity) {}
 
 ErrnoLogMessage::~ErrnoLogMessage() {
     stream() << ": " << SystemErrorCodeToString(err_);
@@ -1207,7 +1709,7 @@ struct VModuleList {
             if (name.find_first_of("*?") == std::string::npos) {
                 _exact_names[name] = verbose_level;
             } else {
-                _wild_names.push_back(std::make_pair(name, verbose_level));
+                _wild_names.emplace_back(name, verbose_level);
             }
         }
         // Reverse _wild_names so that latter wild cards override former ones.

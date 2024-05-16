@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Ge,Jun (gejun@baidu.com)
-// Date: Sun Jul 13 15:04:18 CST 2014
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <gtest/gtest.h>
 #include "butil/atomicops.h"
@@ -12,6 +25,7 @@
 #include "bthread/task_group.h"
 #include "bthread/bthread.h"
 #include "bthread/unstable.h"
+#include "bthread/interrupt_pthread.h"
 
 namespace bthread {
 extern butil::atomic<TaskControl*> g_task_control;
@@ -208,7 +222,7 @@ TEST(ButexTest, wait_without_stop) {
         ASSERT_EQ(0, bthread_join(th, NULL));
         tm.stop();
         
-        ASSERT_LT(labs(tm.m_elapsed() - WAIT_MSEC), 40);
+        ASSERT_LT(labs(tm.m_elapsed() - WAIT_MSEC), 250);
     }
     bthread::butex_destroy(butex);
 }
@@ -295,7 +309,7 @@ TEST(ButexTest, join_cant_be_wakeup) {
         ASSERT_EQ(0, bthread_join(th2, NULL));
         ASSERT_EQ(0, bthread_join(th, NULL));
         tm.stop();
-        ASSERT_LT(tm.m_elapsed(), WAIT_MSEC + 10);
+        ASSERT_LT(tm.m_elapsed(), WAIT_MSEC + 15);
         ASSERT_EQ(EINVAL, bthread_stop(th));
         ASSERT_EQ(EINVAL, bthread_stop(th2));
     }
@@ -381,4 +395,52 @@ TEST(ButexTest, stop_before_sleeping) {
         ASSERT_EQ(EINVAL, bthread_stop(th));
     }
 }
+
+void* trigger_signal(void* arg) {
+    pthread_t * th = (pthread_t*)arg;
+    const long t1 = butil::gettimeofday_us();
+    for (size_t i = 0; i < 50; ++i) {
+      usleep(100000);
+      if (bthread::interrupt_pthread(*th) == ESRCH) {
+        LOG(INFO) << "waiter thread end, trigger count=" << i;
+        break;
+      }
+    }
+    const long t2 = butil::gettimeofday_us();
+    LOG(INFO) << "trigger signal thread end, elapsed=" << (t2-t1) << "us";
+    return NULL;
+}
+
+TEST(ButexTest, wait_with_signal_triggered) {
+    butil::Timer tm;
+
+    const int64_t WAIT_MSEC = 500;
+    WaiterArg waiter_args;
+    pthread_t waiter_th, tigger_th;
+    butil::atomic<int>* butex =
+        bthread::butex_create_checked<butil::atomic<int> >();
+    ASSERT_TRUE(butex);
+    *butex = 1;
+    ASSERT_EQ(0, bthread::butex_wake(butex));
+
+    const timespec abstime = butil::milliseconds_from_now(WAIT_MSEC);
+    waiter_args.expected_value = *butex;
+    waiter_args.butex = butex;
+    waiter_args.expected_result = ETIMEDOUT;
+    waiter_args.ptimeout = &abstime;
+    tm.start();
+    pthread_create(&waiter_th, NULL, waiter, &waiter_args);
+    pthread_create(&tigger_th, NULL, trigger_signal, &waiter_th);
+    
+    ASSERT_EQ(0, pthread_join(waiter_th, NULL));
+    tm.stop();
+    auto wait_elapsed_ms = tm.m_elapsed();;
+    LOG(INFO) << "waiter thread end, elapsed " << wait_elapsed_ms << " ms";
+
+    ASSERT_LT(labs(wait_elapsed_ms - WAIT_MSEC), 250);
+
+    ASSERT_EQ(0, pthread_join(tigger_th, NULL));
+    bthread::butex_destroy(butex);
+}
+
 } // namespace

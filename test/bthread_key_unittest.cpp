@@ -1,6 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Ge,Jun (gejun@baidu.com)
-// Date: Sun Jul 13 15:04:18 CST 2014
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <algorithm>                         // std::sort
 #include "butil/atomicops.h"
@@ -26,10 +39,10 @@ namespace {
 
 // Count tls usages.
 struct Counters {
-    butil::atomic<size_t> ncreate;
-    butil::atomic<size_t> ndestroy;
-    butil::atomic<size_t> nenterthread;
-    butil::atomic<size_t> nleavethread;
+    butil::atomic<size_t> ncreate {0};
+    butil::atomic<size_t> ndestroy {0};
+    butil::atomic<size_t> nenterthread {0};
+    butil::atomic<size_t> nleavethread {0};
 };
 
 // Wrap same counters into different objects to make sure that different key
@@ -74,7 +87,7 @@ static void worker1_impl(Counters* cs) {
             << "i=" << i << " is_bthread=" << !!bthread_self();
             
     }
-    // Sleep awhile to make some context switches. TLS should be unchanged.
+    // Sleep a while to make some context switches. TLS should be unchanged.
     bthread_usleep(10000);
     
     for (size_t i = 0; i < arraysize(k); ++i) {
@@ -90,7 +103,6 @@ static void* worker1(void* arg) {
 
 TEST(KeyTest, creating_key_in_parallel) {
     Counters args;
-    memset(&args, 0, sizeof(args));
     pthread_t th[8];
     bthread_t bth[8];
     for (size_t i = 0; i < arraysize(th); ++i) {
@@ -386,6 +398,58 @@ TEST(KeyTest, using_pool) {
     
     EXPECT_EQ(bth_data.end_seq, bth_data.seq);
     EXPECT_EQ(0, bth2_data.seq);
+
+    ASSERT_EQ(0, bthread_key_delete(key));
+}
+
+// NOTE: lid is short for 'lock in dtor'.
+butil::atomic<size_t> lid_seq(1);
+std::vector<size_t> lid_seqs;
+bthread_mutex_t mu;
+
+static void lid_dtor(void* tls) {
+    bthread_mutex_lock(&mu);
+    lid_seqs.push_back((size_t)tls);
+    bthread_mutex_unlock(&mu);
+}
+
+static void lid_worker_impl(bthread_key_t key) {
+    ASSERT_EQ(NULL, bthread_getspecific(key));
+    ASSERT_EQ(0, bthread_setspecific(key, (void*)seq.fetch_add(1)));
+}
+
+static void* lid_worker(void* arg) {
+    lid_worker_impl(*static_cast<bthread_key_t*>(arg));
+    return NULL;
+}
+
+TEST(KeyTest, use_bthread_mutex_in_dtor) {
+    bthread_key_t key;
+
+    ASSERT_EQ(0, bthread_mutex_init(&mu, nullptr));
+    ASSERT_EQ(0, bthread_key_create(&key, lid_dtor));
+
+    lid_seqs.clear();
+
+    bthread_t bth[8];
+    for (size_t i = 0; i < arraysize(bth); ++i) {
+        ASSERT_EQ(0, bthread_start_urgent(&bth[i], NULL, lid_worker, &key));
+    }
+    pthread_t th[8];
+    for (size_t i = 0; i < arraysize(th); ++i) {
+        ASSERT_EQ(0, pthread_create(&th[i], NULL, lid_worker, &key));
+    }
+    for (size_t i = 0; i < arraysize(bth); ++i) {
+        ASSERT_EQ(0, bthread_join(bth[i], NULL));
+    }
+    for (size_t i = 0; i < arraysize(th); ++i) {
+        ASSERT_EQ(0, pthread_join(th[i], NULL));
+    }
+    ASSERT_EQ(arraysize(th) + arraysize(bth), lid_seqs.size());
+    std::sort(lid_seqs.begin(), lid_seqs.end());
+    ASSERT_EQ(lid_seqs.end(), std::unique(lid_seqs.begin(), lid_seqs.end()));
+    ASSERT_EQ(arraysize(th) + arraysize(bth) - 1,
+                *(lid_seqs.end() - 1) - *lid_seqs.begin());
 
     ASSERT_EQ(0, bthread_key_delete(key));
 }

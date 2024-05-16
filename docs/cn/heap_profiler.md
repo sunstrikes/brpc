@@ -37,7 +37,7 @@ WARNING: 12-26 10:01:25:   * 0 [src/brpc/input_messenger.cpp:132][4294969345] Au
 
 ![img](../images/heap_profiler_1.png)
 
-左上角是当前程序通过malloc分配的内存总量，顺着箭头上的数字可以看到内存来自哪些函数。
+左上角是当前程序通过malloc分配的内存总量，顺着箭头上的数字可以看到内存来自哪些函数。方框内第一个百分比是本函数的内存占用比例, 第二个百分比是本函数及其子函数的内存占用比例
 
 点击左上角的text选择框可以查看文本格式的结果，有时候这种按分配量排序的形式更方便。
 
@@ -52,7 +52,7 @@ WARNING: 12-26 10:01:25:   * 0 [src/brpc/input_messenger.cpp:132][4294969345] Au
 
 ![img](../images/heap_profiler_3.gif)
 
-你也可以使用pprof脚本（tools/pprof）在命令行中查看文本格式结果：
+在Linux下，你也可以使用pprof脚本（tools/pprof）在命令行中查看文本格式结果：
 
 ```
 $ tools/pprof --text db-rpc-dev00.db01:8765/pprof/heap    
@@ -103,3 +103,7 @@ brpc还提供一个类似的growth profiler分析内存的分配去向（不考�
 
 ![img](../images/growth_profiler.png)
 
+# MacOS的额外配置
+
+1. 安装[standalone pprof](https://github.com/google/pprof)，并把下载的pprof二进制文件路径写入环境变量GOOGLE_PPROF_BINARY_PATH中
+2. 安装llvm-symbolizer（将函数符号转化为函数名），直接用brew安装即可：`brew install llvm`

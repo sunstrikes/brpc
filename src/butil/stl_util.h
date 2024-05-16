@@ -15,6 +15,8 @@
 
 #include "butil/logging.h"
 
+namespace butil {
+
 // Clears internal memory of an STL object.
 // STL clear()/reserve(0) does not always free internal memory allocated
 // This function uses swap/destructor to ensure the internal memory is freed.
@@ -170,8 +172,8 @@ void STLDeleteValues(T* container) {
 template<class T>
 class STLElementDeleter {
  public:
-  STLElementDeleter<T>(T* container) : container_(container) {}
-  ~STLElementDeleter<T>() { STLDeleteElements(container_); }
+  STLElementDeleter(T* container) : container_(container) {}
+  ~STLElementDeleter() { STLDeleteElements(container_); }
 
  private:
   T* container_;
@@ -182,8 +184,8 @@ class STLElementDeleter {
 template<class T>
 class STLValueDeleter {
  public:
-  STLValueDeleter<T>(T* container) : container_(container) {}
-  ~STLValueDeleter<T>() { STLDeleteValues(container_); }
+  STLValueDeleter(T* container) : container_(container) {}
+  ~STLValueDeleter() { STLDeleteValues(container_); }
 
  private:
   T* container_;
@@ -195,8 +197,6 @@ template <typename Collection, typename Key>
 bool ContainsKey(const Collection& collection, const Key& key) {
   return collection.find(key) != collection.end();
 }
-
-namespace butil {
 
 // Returns true if the container is sorted.
 template <typename Container>

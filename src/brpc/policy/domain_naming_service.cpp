@@ -1,19 +1,21 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
-
+#include <gflags/gflags.h>
 #include "butil/build_config.h"                       // OS_MACOSX
 #include <netdb.h>                                    // gethostbyname_r
 #include <stdlib.h>                                   // strtol
@@ -22,11 +24,14 @@
 #include "brpc/log.h"
 #include "brpc/policy/domain_naming_service.h"
 
+DEFINE_bool(dns_support_ipv6, false, "Resolve DNS by IPV6 address first");
 
 namespace brpc {
 namespace policy {
 
-DomainNamingService::DomainNamingService() : _aux_buf_len(0) {}
+DomainNamingService::DomainNamingService(int default_port)
+    : _aux_buf_len(0)
+    , _default_port(default_port) {}
 
 int DomainNamingService::GetServers(const char* dns_name,
                                     std::vector<ServerNode>* servers) {
@@ -37,7 +42,7 @@ int DomainNamingService::GetServers(const char* dns_name,
     }
 
     // Should be enough to hold host name
-    char buf[128];
+    char buf[256];
     size_t i = 0;
     for (; i < sizeof(buf) - 1 && dns_name[i] != '\0'
              && dns_name[i] != ':' && dns_name[i] != '/'; ++i) {
@@ -49,7 +54,7 @@ int DomainNamingService::GetServers(const char* dns_name,
     }
     
     buf[i] = '\0';
-    int port = 80;  // default port of HTTP
+    int port = _default_port;
     if (dns_name[i] == ':') {
         ++i;
         char* end = NULL;
@@ -72,6 +77,33 @@ int DomainNamingService::GetServers(const char* dns_name,
     if (port < 0 || port > 65535) {
         LOG(ERROR) << "Invalid port=" << port << " in `" << dns_name << '\'';
         return -1;
+    }
+
+    if (FLAGS_dns_support_ipv6) {
+        struct addrinfo hints;
+        struct addrinfo* addrResult;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET6;
+        hints.ai_socktype = SOCK_DGRAM;
+        char portBuf[16];
+        snprintf(portBuf, arraysize(portBuf), "%d", port);
+        auto ret = getaddrinfo(buf, portBuf, &hints, &addrResult);
+        if (!ret) {
+            for(auto rp = addrResult; rp != NULL; rp = rp->ai_next) {
+                butil::EndPoint point;
+                auto ret = butil::sockaddr2endpoint((struct sockaddr_storage*)rp->ai_addr, rp->ai_addrlen, &point);
+                if(!ret) {
+                    servers->push_back(ServerNode(point, std::string()));
+                }
+            }
+
+            freeaddrinfo(addrResult);
+            return 0;
+        } else {
+            LOG(WARNING) << "Can't resolve `" << buf << "for ipv6, fallback to ipv4";
+            // fallback to ipv4
+        }
+        
     }
 
 #if defined(OS_MACOSX)
@@ -118,6 +150,7 @@ int DomainNamingService::GetServers(const char* dns_name,
     }
 #endif
 
+    //TODO add protocols other than IPv4 supports
     butil::EndPoint point;
     point.port = port;
     for (int i = 0; result->h_addr_list[i] != NULL; ++i) {
@@ -140,7 +173,7 @@ void DomainNamingService::Describe(
 }
 
 NamingService* DomainNamingService::New() const {
-    return new DomainNamingService;
+    return new DomainNamingService(_default_port);
 }
 
 void DomainNamingService::Destroy() {

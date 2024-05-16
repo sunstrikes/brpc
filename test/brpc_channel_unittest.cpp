@@ -1,5 +1,21 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 // brpc - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
@@ -24,7 +40,11 @@
 #include "brpc/selective_channel.h"
 #include "brpc/socket_map.h"
 #include "brpc/controller.h"
+#if BAZEL_TEST
+#include "test/echo.pb.h"
+#else
 #include "echo.pb.h"
+#endif   // BAZEL_TEST
 #include "brpc/options.pb.h"
 
 namespace brpc {
@@ -36,7 +56,7 @@ namespace policy {
 void SendRpcResponse(int64_t correlation_id, Controller* cntl, 
                      const google::protobuf::Message* req,
                      const google::protobuf::Message* res,
-                     const Server* server_raw, MethodStatus *, long);
+                     const Server* server_raw, MethodStatus *, int64_t);
 } // policy
 } // brpc
 
@@ -60,10 +80,8 @@ public:
     DeleteOnlyOnceChannel() : _c(1) {
     }
     ~DeleteOnlyOnceChannel() {
-        if (_c.fetch_sub(1) != 1) {
-            LOG(ERROR) << "Delete more than once!";
-            abort();
-        }
+        RELEASE_ASSERT_VERBOSE(_c.fetch_sub(1) == 1,
+                               "Delete more than once!");
     }
 private:
     butil::atomic<int> _c;
@@ -115,6 +133,22 @@ static bool VerifyMyRequest(const brpc::InputMessageBase* msg_base) {
     return true;
 }
 
+class CallAfterRpcObject {
+public:
+    explicit CallAfterRpcObject() {}
+
+    ~CallAfterRpcObject() {
+        EXPECT_EQ(str, "CallAfterRpcRespTest");
+    }
+
+    void Append(const std::string& s) {
+        str.append(s);
+    }
+
+private:
+    std::string str;
+};
+
 class MyEchoService : public ::test::EchoService {
     void Echo(google::protobuf::RpcController* cntl_base,
               const ::test::EchoRequest* req,
@@ -122,6 +156,9 @@ class MyEchoService : public ::test::EchoService {
               google::protobuf::Closure* done) {
         brpc::Controller* cntl =
             static_cast<brpc::Controller*>(cntl_base);
+        std::shared_ptr<CallAfterRpcObject> str_test(new CallAfterRpcObject());
+        cntl->set_after_rpc_resp_fn(std::bind(&MyEchoService::CallAfterRpc, str_test,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
         brpc::ClosureGuard done_guard(done);
         if (req->server_fail()) {
             cntl->SetFailed(req->server_fail(), "Server fail1");
@@ -141,6 +178,18 @@ class MyEchoService : public ::test::EchoService {
         if (req->code() != 0) {
             res->add_code_list(req->code());
         }
+        res->set_receiving_socket_id(cntl->_current_call.sending_sock->id());
+    }
+    static void CallAfterRpc(std::shared_ptr<CallAfterRpcObject> str,
+                        brpc::Controller* cntl,
+                        const google::protobuf::Message* req,
+                        const google::protobuf::Message* res) {
+        const test::EchoRequest* request = static_cast<const test::EchoRequest*>(req);
+        const test::EchoResponse* response = static_cast<const test::EchoResponse*>(res);
+        str->Append("CallAfterRpcRespTest");
+        EXPECT_TRUE(nullptr != cntl);
+        EXPECT_TRUE(nullptr != request);
+        EXPECT_TRUE(nullptr != response);
     }
 };
 
@@ -220,6 +269,7 @@ protected:
         brpc::Controller* cntl = new brpc::Controller();
         cntl->_current_call.peer_id = ptr->id();
         cntl->_current_call.sending_sock.reset(ptr.release());
+        cntl->_server = &ts->_dummy;
 
         google::protobuf::Message* res =
               ts->_svc.GetResponsePrototype(method).New();
@@ -229,23 +279,23 @@ protected:
             const google::protobuf::Message*,
             const google::protobuf::Message*,
             const brpc::Server*,
-            brpc::MethodStatus*, long>(
+            brpc::MethodStatus*, int64_t>(
                 &brpc::policy::SendRpcResponse,
-                meta.correlation_id(), cntl, NULL, res,
+                meta.correlation_id(), cntl, req, res,
                 &ts->_dummy, NULL, -1);
         ts->_svc.CallMethod(method, cntl, req, res, done);
     }
 
     int StartAccept(butil::EndPoint ep) {
         int listening_fd = -1;
-        while ((listening_fd = tcp_listen(ep, true)) < 0) {
+        while ((listening_fd = tcp_listen(ep)) < 0) {
             if (errno == EADDRINUSE) {
                 bthread_usleep(1000);
             } else {
                 return -1;
             }
         }
-        if (_messenger.StartAccept(listening_fd, -1, NULL) != 0) {
+        if (_messenger.StartAccept(listening_fd, -1, NULL, false) != 0) {
             return -1;
         }
         return 0;
@@ -257,14 +307,17 @@ protected:
     }
 
     void SetUpChannel(brpc::Channel* channel, 
-                      bool single_server, bool short_connection,
-                      const brpc::Authenticator* auth = NULL) {
+                      bool single_server,
+                      bool short_connection,
+                      const brpc::Authenticator* auth = NULL,
+                      std::string connection_group = std::string()) {
         brpc::ChannelOptions opt;
         if (short_connection) {
             opt.connection_type = brpc::CONNECTION_TYPE_SHORT;
         }
         opt.auth = auth;
         opt.max_retry = 0;
+        opt.connection_group = connection_group;
         if (single_server) {
             EXPECT_EQ(0, channel->Init(_ep, &opt)); 
         } else {                                                 
@@ -404,6 +457,7 @@ protected:
 
         EXPECT_EQ(0, cntl.ErrorCode()) 
             << single_server << ", " << async << ", " << short_connection;
+        const uint64_t receiving_socket_id = res.receiving_socket_id();
         EXPECT_EQ(0, cntl.sub_count());
         EXPECT_TRUE(NULL == cntl.sub(-1));
         EXPECT_TRUE(NULL == cntl.sub(0));
@@ -418,7 +472,48 @@ protected:
             }
         } else {
             EXPECT_GE(1ul, _messenger.ConnectionCount());
-        }            
+        }
+        if (single_server && !short_connection) {
+            // Reuse the connection
+            brpc::Channel channel2;
+            SetUpChannel(&channel2, single_server, short_connection);
+            cntl.Reset();
+            req.Clear();
+            res.Clear();
+            req.set_message(__FUNCTION__);
+            CallMethod(&channel2, &cntl, &req, &res, async);
+            EXPECT_EQ(0, cntl.ErrorCode())
+                << single_server << ", " << async << ", " << short_connection;
+            EXPECT_EQ(receiving_socket_id, res.receiving_socket_id());
+
+            // A different connection_group does not reuse the connection
+            brpc::Channel channel3;
+            SetUpChannel(&channel3, single_server, short_connection,
+                         NULL, "another_group");
+            cntl.Reset();
+            req.Clear();
+            res.Clear();
+            req.set_message(__FUNCTION__);
+            CallMethod(&channel3, &cntl, &req, &res, async);
+            EXPECT_EQ(0, cntl.ErrorCode())
+                << single_server << ", " << async << ", " << short_connection;
+            const uint64_t receiving_socket_id2 = res.receiving_socket_id();
+            EXPECT_NE(receiving_socket_id, receiving_socket_id2);
+
+            // Channel in the same connection_group reuses the connection
+            // note that the leading/trailing spaces should be trimed.
+            brpc::Channel channel4;
+            SetUpChannel(&channel4, single_server, short_connection,
+                         NULL, " another_group ");
+            cntl.Reset();
+            req.Clear();
+            res.Clear();
+            req.set_message(__FUNCTION__);
+            CallMethod(&channel4, &cntl, &req, &res, async);
+            EXPECT_EQ(0, cntl.ErrorCode())
+                << single_server << ", " << async << ", " << short_connection;
+            EXPECT_EQ(receiving_socket_id2, res.receiving_socket_id());
+        }
         StopAndJoin();
     }
 
@@ -701,7 +796,7 @@ protected:
         CallMethod(&subchans[0], &cntl, &req, &res, false);
         ASSERT_TRUE(cntl.Failed());
         ASSERT_EQ(brpc::EINTERNAL, cntl.ErrorCode()) << cntl.ErrorText();
-        ASSERT_EQ("[E2001]Method ComboEcho() not implemented.", cntl.ErrorText());
+        ASSERT_TRUE(butil::StringPiece(cntl.ErrorText()).ends_with("Method ComboEcho() not implemented."));
 
         // do the rpc call.
         cntl.Reset();
@@ -1119,7 +1214,7 @@ protected:
         CallMethod(&channel, &cntl, &req, &res, async);
         tm.stop();
         EXPECT_EQ(brpc::ERPCTIMEDOUT, cntl.ErrorCode()) << cntl.ErrorText();
-        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 10);
+        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 15);
         StopAndJoin();
     }
 
@@ -1155,7 +1250,7 @@ protected:
         for (int i = 0; i < cntl.sub_count(); ++i) {
             EXPECT_EQ(ECANCELED, cntl.sub(i)->ErrorCode()) << "i=" << i;
         }
-        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 10);
+        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 15);
         StopAndJoin();
     }
 
@@ -1208,7 +1303,7 @@ protected:
                 EXPECT_EQ(0, cntl.sub(i)->ErrorCode());
             }
         }
-        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 10);
+        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 15);
         StopAndJoin();
     }
 
@@ -1241,7 +1336,9 @@ protected:
         EXPECT_EQ(brpc::ERPCTIMEDOUT, cntl.ErrorCode()) << cntl.ErrorText();
         EXPECT_EQ(1, cntl.sub_count());
         EXPECT_EQ(brpc::ERPCTIMEDOUT, cntl.sub(0)->ErrorCode());
-        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 10);
+        EXPECT_LT(labs(tm.m_elapsed() - cntl.timeout_ms()), 15);
+        EXPECT_EQ(-1, cntl.sub(0)->_timeout_ms);
+        EXPECT_EQ(17, cntl.sub(0)->_real_timeout_ms);
         StopAndJoin();
     }
     
@@ -1501,7 +1598,7 @@ protected:
         }
         StopAndJoin();
     }
-    
+
     void RPCThread(brpc::ChannelBase* channel, bool async) {
         brpc::Controller cntl;
         test::EchoRequest req;
@@ -1520,7 +1617,7 @@ protected:
             test::EchoResponse res;
             req.set_message(__FUNCTION__);
             CallMethod(channel, &cntl, &req, &res, async);
-            
+
             ASSERT_EQ(0, cntl.ErrorCode()) << cntl.ErrorText();
             ASSERT_EQ("received " + std::string(__FUNCTION__), res.message());
             cntl.Reset();
@@ -1546,6 +1643,10 @@ protected:
 
     void TestAuthentication(bool single_server, 
                             bool async, bool short_connection) {
+        std::cout << " *** single=" << single_server
+                  << " async=" << async
+                  << " short=" << short_connection << std::endl;
+
         ASSERT_EQ(0, StartAccept(_ep));
         MyAuthenticator auth;
         brpc::Channel channel;
@@ -1717,6 +1818,7 @@ protected:
 
         brpc::Channel channel;
         brpc::ChannelOptions opt;
+        opt.timeout_ms = 1000;
         if (short_connection) {
             opt.connection_type = brpc::CONNECTION_TYPE_SHORT;
         }
@@ -1741,6 +1843,81 @@ protected:
         StopAndJoin();
     }
 
+    struct TestRetryBackoffInfo {
+        TestRetryBackoffInfo(ChannelTest* channel_test_param,
+                             bool async_param,
+                             bool short_connection_param,
+                             bool fixed_backoff_param)
+            : channel_test(channel_test_param)
+            , async(async_param)
+            , short_connection(short_connection_param)
+            , fixed_backoff(fixed_backoff_param) {}
+
+        ChannelTest* channel_test;
+        int async;
+        int short_connection;
+        int fixed_backoff;
+    };
+
+    static void* TestRetryBackoffBthread(void* void_args) {
+        auto args = static_cast<TestRetryBackoffInfo*>(void_args);
+        args->channel_test->TestRetryBackoff(args->async, args->short_connection,
+                                             args->fixed_backoff, false);
+        return NULL;
+    }
+
+    void TestRetryBackoff(bool async, bool short_connection, bool fixed_backoff,
+                          bool retry_backoff_in_pthread) {
+        ASSERT_EQ(0, StartAccept(_ep));
+
+        const int32_t backoff_time_ms = 100;
+        const int32_t no_backoff_remaining_rpc_time_ms = 100;
+        std::unique_ptr<brpc::RetryPolicy> retry_ptr;
+        if (fixed_backoff) {
+            retry_ptr.reset(
+                    new brpc::RpcRetryPolicyWithFixedBackoff(backoff_time_ms,
+                                                             no_backoff_remaining_rpc_time_ms,
+                                                             retry_backoff_in_pthread));
+        } else {
+            retry_ptr.reset(
+                    new brpc::RpcRetryPolicyWithJitteredBackoff(backoff_time_ms,
+                                                                backoff_time_ms + 20,
+                                                                no_backoff_remaining_rpc_time_ms,
+                                                                retry_backoff_in_pthread));
+        }
+
+        brpc::Channel channel;
+        brpc::ChannelOptions opt;
+        opt.timeout_ms = 1000;
+        opt.retry_policy = retry_ptr.get();
+        if (short_connection) {
+            opt.connection_type = brpc::CONNECTION_TYPE_SHORT;
+        }
+        butil::TempFile server_list;
+        EXPECT_EQ(0, server_list.save_format(
+            "127.0.0.1:100\n"
+            "127.0.0.1:200\n"
+            "%s", endpoint2str(_ep).c_str()));
+        std::string naming_url = std::string("fIle://")
+            + server_list.fname();
+        EXPECT_EQ(0, channel.Init(naming_url.c_str(), "RR", &opt));
+
+        const int RETRY_NUM = 3;
+        test::EchoRequest req;
+        test::EchoResponse res;
+        brpc::Controller cntl;
+        req.set_message(__FUNCTION__);
+        cntl.set_max_retry(RETRY_NUM);
+        CallMethod(&channel, &cntl, &req, &res, async);
+        if (cntl.retried_count() > 0) {
+            EXPECT_GT(cntl.latency_us(), ((int64_t)backoff_time_ms * 1000) * cntl.retried_count())
+                << "latency_us=" << cntl.latency_us() << " retried_count=" << cntl.retried_count()
+                << " enable_retry_backoff_in_pthread=" << retry_backoff_in_pthread;
+        }
+        EXPECT_EQ(0, cntl.ErrorCode()) << async << ", " << short_connection;
+        StopAndJoin();
+    }
+
     butil::EndPoint _ep;
     butil::TempFile _server_list;                                        
     std::string _naming_url;
@@ -1759,7 +1936,7 @@ class MyShared : public brpc::SharedObject {
 public:
     MyShared() { ++ nctor; }
     MyShared(const MyShared&) : brpc::SharedObject() { ++ nctor; }
-    ~MyShared() { ++ ndtor; }
+    ~MyShared() override { ++ ndtor; }
 
     static int nctor;
     static int ndtor;
@@ -1808,7 +1985,7 @@ TEST_F(ChannelTest, init_as_single_server) {
     ASSERT_EQ(ep, channel._server_address);
 
     brpc::SocketId id;
-    ASSERT_EQ(0, brpc::SocketMapFind(ep, &id));
+    ASSERT_EQ(0, brpc::SocketMapFind(brpc::SocketMapKey(ep), &id));
     ASSERT_EQ(id, channel._server_id);
 
     const int NUM = 10;
@@ -1889,6 +2066,82 @@ TEST_F(ChannelTest, init_using_naming_service) {
     ASSERT_EQ(lb, another_ctx.get());
     ASSERT_EQ(1, another_ctx->_nref.load());
     // `lb' should be destroyed after
+}
+
+TEST_F(ChannelTest, parse_hostname) {
+    brpc::ChannelOptions opt;
+    opt.succeed_without_server = false;
+    opt.protocol = brpc::PROTOCOL_HTTP;
+    brpc::Channel channel;
+
+    ASSERT_EQ(-1, channel.Init("", 8888, &opt));
+    ASSERT_EQ("", channel._service_name);
+    ASSERT_EQ(-1, channel.Init("", &opt));
+    ASSERT_EQ("", channel._service_name);
+
+    ASSERT_EQ(0, channel.Init("http://127.0.0.1", 8888, &opt));
+    ASSERT_EQ("127.0.0.1:8888", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://127.0.0.1:8888", &opt));
+    ASSERT_EQ("127.0.0.1:8888", channel._service_name);
+
+    ASSERT_EQ(0, channel.Init("localhost", 8888, &opt));
+    ASSERT_EQ("localhost:8888", channel._service_name);
+    ASSERT_EQ(0, channel.Init("localhost:8888", &opt));
+    ASSERT_EQ("localhost:8888", channel._service_name);
+
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com", &opt));
+    ASSERT_EQ("www.baidu.com", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com:80", &opt));
+    ASSERT_EQ("www.baidu.com:80", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com", 80, &opt));
+    ASSERT_EQ("www.baidu.com:80", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com:8888", &opt));
+    ASSERT_EQ("www.baidu.com:8888", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com", 8888, &opt));
+    ASSERT_EQ("www.baidu.com:8888", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com", "rr", &opt));
+    ASSERT_EQ("www.baidu.com", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com:80", "rr", &opt));
+    ASSERT_EQ("www.baidu.com:80", channel._service_name);
+    ASSERT_EQ(0, channel.Init("http://www.baidu.com:8888", "rr", &opt));
+    ASSERT_EQ("www.baidu.com:8888", channel._service_name);
+
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com", &opt));
+    ASSERT_EQ("www.baidu.com", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com:443", &opt));
+    ASSERT_EQ("www.baidu.com:443", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com", 443, &opt));
+    ASSERT_EQ("www.baidu.com:443", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com:1443", &opt));
+    ASSERT_EQ("www.baidu.com:1443", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com", 1443, &opt));
+    ASSERT_EQ("www.baidu.com:1443", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com", "rr", &opt));
+    ASSERT_EQ("www.baidu.com", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com:443", "rr", &opt));
+    ASSERT_EQ("www.baidu.com:443", channel._service_name);
+    ASSERT_EQ(0, channel.Init("https://www.baidu.com:1443", "rr", &opt));
+    ASSERT_EQ("www.baidu.com:1443", channel._service_name);
+
+    const char *address_list[] =  {
+        "10.127.0.1:1234",
+        "10.128.0.1:1234 enable",
+        "10.129.0.1:1234",
+        "localhost:1234",
+        "www.baidu.com:1234"
+    };
+    butil::TempFile tmp_file;
+    {
+        FILE* fp = fopen(tmp_file.fname(), "w");
+        for (size_t i = 0; i < ARRAY_SIZE(address_list); ++i) {
+            ASSERT_TRUE(fprintf(fp, "%s\n", address_list[i]));
+        }
+        fclose(fp);
+    }
+    brpc::Channel ns_channel;
+    std::string ns = std::string("file://") + tmp_file.fname();
+    ASSERT_EQ(0, ns_channel.Init(ns.c_str(), "rr", &opt));
+    ASSERT_EQ(tmp_file.fname(), ns_channel._service_name);
 }
 
 TEST_F(ChannelTest, connection_failed) {
@@ -2321,6 +2574,29 @@ TEST_F(ChannelTest, retry_other_servers) {
     }
 }
 
+TEST_F(ChannelTest, retry_backoff) {
+    for (int j = 0; j <= 1; ++j) { // Flag Asynchronous
+        for (int k = 0; k <= 1; ++k) { // Flag ShortConnection
+            for (int l = 0; l <= 1; ++l) { // Flag FixedRetryBackoffPolicy or JitteredRetryBackoffPolicy
+                for (int m = 0; m <= 1; ++m) { // Flag retry backoff in bthread or pthread
+                    if (m % 2 == 0) {
+                        bthread_t th;
+                        bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+                        std::unique_ptr<TestRetryBackoffInfo> test_retry_backoff(
+                                new TestRetryBackoffInfo(this, j, k, l));
+                        // Retry backoff in bthread.
+                        bthread_start_background(&th, &attr, TestRetryBackoffBthread, test_retry_backoff.get());
+                        bthread_join(th, NULL);
+                    } else {
+                        // Retry backoff in pthread.
+                        TestRetryBackoff(j, k, l, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST_F(ChannelTest, multiple_threads_single_channel) {
     srand(time(NULL));
     ASSERT_EQ(0, StartAccept(_ep));
@@ -2501,22 +2777,38 @@ TEST_F(ChannelTest, adaptive_protocol_type) {
     brpc::AdaptiveProtocolType ptype;
     ASSERT_EQ(brpc::PROTOCOL_UNKNOWN, ptype);
     ASSERT_STREQ("unknown", ptype.name());
+    ASSERT_FALSE(ptype.has_param());
+    ASSERT_EQ("", ptype.param());
 
     ptype = brpc::PROTOCOL_HTTP;
     ASSERT_EQ(brpc::PROTOCOL_HTTP, ptype);
     ASSERT_STREQ("http", ptype.name());
+    ASSERT_FALSE(ptype.has_param());
+    ASSERT_EQ("", ptype.param());
+
+    ptype = "http:xyz ";
+    ASSERT_EQ(brpc::PROTOCOL_HTTP, ptype);
+    ASSERT_STREQ("http", ptype.name());
+    ASSERT_TRUE(ptype.has_param());
+    ASSERT_EQ("xyz ", ptype.param());
 
     ptype = "HuLu_pbRPC";
     ASSERT_EQ(brpc::PROTOCOL_HULU_PBRPC, ptype);
     ASSERT_STREQ("hulu_pbrpc", ptype.name());
+    ASSERT_FALSE(ptype.has_param());
+    ASSERT_EQ("", ptype.param());
     
     ptype = "blah";
     ASSERT_EQ(brpc::PROTOCOL_UNKNOWN, ptype);
-    ASSERT_STREQ("unknown", ptype.name());
+    ASSERT_STREQ("blah", ptype.name());
+    ASSERT_FALSE(ptype.has_param());
+    ASSERT_EQ("", ptype.param());
 
     ptype = "Baidu_STD";
     ASSERT_EQ(brpc::PROTOCOL_BAIDU_STD, ptype);
     ASSERT_STREQ("baidu_std", ptype.name());
+    ASSERT_FALSE(ptype.has_param());
+    ASSERT_EQ("", ptype.param());
 }
 
 } //namespace

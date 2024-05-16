@@ -1,6 +1,6 @@
 [中文版](../cn/error_code.md)
 
-brpc use [brpc::Controller](https://github.com/brpc/brpc/blob/master/src/brpc/controller.h) to set and get parameters for one RPC. `Controller::ErrorCode()` and `Controller::ErrorText()` return error code and description of the RPC respectively, only accessible after completion of the RPC, otherwise the result is undefined. `ErrorText()` is defined by the base class of the Controller: `google::protobuf::RpcController`, while `ErrorCode()` is defined by `brpc::Controller`. Controller also has a method `Failed()` to tell whether RPC fails or not. Relations between the three methods:
+brpc use [brpc::Controller](https://github.com/apache/brpc/blob/master/src/brpc/controller.h) to set and get parameters for one RPC. `Controller::ErrorCode()` and `Controller::ErrorText()` return error code and description of the RPC respectively, only accessible after completion of the RPC, otherwise the result is undefined. `ErrorText()` is defined by the base class of the Controller: `google::protobuf::RpcController`, while `ErrorCode()` is defined by `brpc::Controller`. Controller also has a method `Failed()` to tell whether RPC fails or not. Relations between the three methods:
 
 -  When `Failed()` is true, `ErrorCode()` must be non-zero and `ErrorText()` be non-empty.
 -  When `Failed()` is false, `ErrorCode()` is 0 and `ErrorText()` is undefined (it's empty in brpc currently, but you'd better not rely on this)
@@ -15,17 +15,18 @@ Both client and server in brpc have `Controller`, which can be set with `setFail
 
 # Error Code in brpc
 
-All error codes in brpc are defined in [errno.proto](https://github.com/brpc/brpc/blob/master/src/brpc/errno.proto), in which those begin with *SYS_* are defined by linux system and exactly same with the ones defined in `/usr/include/errno.h`. The reason that we put it in .proto is to cross language. The rest of the error codes are defined by brpc.
+All error codes in brpc are defined in [errno.proto](https://github.com/apache/brpc/blob/master/src/brpc/errno.proto), in which those begin with *SYS_* are defined by linux system and exactly same with the ones defined in `/usr/include/errno.h`. The reason that we put it in .proto is to cross language. The rest of the error codes are defined by brpc.
 
-[berror(error_code)](https://github.com/brpc/brpc/blob/master/src/butil/errno.h) gets description for the error code, and `berror()` gets description for current [system errno](http://www.cplusplus.com/reference/cerrno/errno/). Note that **ErrorText() != berror(ErorCode())** since `ErrorText()` contains more specific information. brpc includes berror by default so that you can use it in your project directly.
+[berror(error_code)](https://github.com/apache/brpc/blob/master/src/butil/errno.h) gets description for the error code, and `berror()` gets description for current [system errno](http://www.cplusplus.com/reference/cerrno/errno/). Note that **ErrorText() != berror(ErorCode())** since `ErrorText()` contains more specific information. brpc includes berror by default so that you can use it in your project directly.
 
 Following table shows common error codes and their descriptions: 
 
 | Error Code     | Value | Retry | Description                              | Logging message                          |
 | -------------- | ----- | ----- | ---------------------------------------- | ---------------------------------------- |
 | EAGAIN         | 11    | Yes   | Too many requests at the same time, hardly happening as it's a soft limit. | Resource temporarily unavailable         |
+| ENODATA        | 61   | 是    | 1. The server list returned by Naming Service is empty. 2. When Naming Service changes with all instances modified, Naming Service updates LB by first Remove all and then Add all, the LB instance list may become empty within a short period of time. | Fail to select server from xxx |
 | ETIMEDOUT      | 110   | Yes   | Connection timeout.                      | Connection timed out                     |
-| EHOSTDOWN      | 112   | Yes   | No available server to send request. The servers may be stopped or stopping(returning ELOGOFF). | "Fail to select server from …"  "Not connected to … yet" |
+| EHOSTDOWN      | 112   | Yes   | Possible reasons: A. The list returned by Naming Server is not empty, but LB cannot select an available server, and LB returns an EHOSTDOWN error. Specific possible reasons: a. Server is exiting (returned ELOGOFF) b. Server was blocked because of some previous failure, the specific logic of the block: 1. For single connection type, the only connection socket is blocked by SetFail, and there are many occurrences of SetFailed in the code to trigger this block. 2. For pooled/short connection type, only when the error number meets does_error_affect_main_socket (ECONNREFUSED, ENETUNREACH, EHOSTUNREACH or EINVAL) will it be blocked 3. After blocking, there is a CheckHealth thread to do health check, Just try to connect, the check interval is controlled by the health_check_interval_s of SocketOptions, and the Socket will be unblocked if it is connected successfully. B. Use the SingleServer method to initialize the Channel (without LB), and the only connection is LOGOFF or blocked (same as above) | "Fail to select server from …"  "Not connected to … yet" |
 | ENOSERVICE     | 1001  | No    | Can't locate the service, hardly happening and usually being ENOMETHOD instead |                                          |
 | ENOMETHOD      | 1002  | No    | Can't locate the method.                 | Misc forms, common ones are "Fail to find method=…" |
 | EREQUEST       | 1003  | No    | fail to serialize the request, may be set on either client-side or server-side | Misc forms: "Missing required fields in request: …" "Fail to parse request message, …"  "Bad request" |
@@ -35,7 +36,7 @@ Following table shows common error codes and their descriptions:
 | ERPCTIMEDOUT   | 1008  | No    | RPC timeout.                             | "reached timeout=%dms"                   |
 | EFAILEDSOCKET  | 1009  | Yes   | The connection is broken during RPC      | "The socket was SetFailed"               |
 | EHTTP          | 1010  | No    | HTTP responses with non 2xx status code are treated as failure and set with this code. No retry by default, changeable by customizing RetryPolicy. | Bad http call                            |
-| EOVERCROWDED   | 1011  | Yes   | Too many messages to buffer at the sender side. Usually caused by lots of concurrent asynchronous requests. Modifiable by `-socket_max_unwritten_bytes`, 8MB by default. | The server is overcrowded                |
+| EOVERCROWDED   | 1011  | Yes   | Too many messages to buffer at the sender side. Usually caused by lots of concurrent asynchronous requests. Modifiable by `-socket_max_unwritten_bytes`, 64MB by default. | The server is overcrowded                |
 | EINTERNAL      | 2001  | No    | The default error for `Controller::SetFailed` without specifying a one. | Internal Server Error                    |
 | ERESPONSE      | 2002  | No    | fail to serialize the response, may be set on either client-side or server-side | Misc forms: "Missing required fields in response: …" "Fail to parse response message, " "Bad response" |
 | ELOGOFF        | 2003  | Yes   | Server has been stopped                  | "Server is going to quit"                |

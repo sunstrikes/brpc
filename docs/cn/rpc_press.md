@@ -5,6 +5,7 @@ rpc_press无需写代码就压测各种rpc server，目前支持的协议有：
 - sofa-pbrpc
 - public_pbrpc
 - nova_pbrpc
+- google_grpc
 
 # 获取工具
 
@@ -26,7 +27,7 @@ json也可以写在文件中，假如./input.json包含了上述两个请求，-
 
 - -proto：指定相关的proto文件名。
 - -method：指定方法名，形式必须是package.service.method。
-- -server：当-lb_policy为空时，是服务器的ip:port；当-lb_policy不为空时，是集群地址，比如bns://node-name, file://server_list等等。具体见[名字服务](client.md#名字服务)。
+- -server：当-lb_policy为空时，是服务器的ip:port；当-lb_policy不为空时，是集群地址，比如bns://node-name, file://server_list等等。具体见[命名服务](client.md#命名服务)。
 - -input: 指定json请求或包含json请求的文件。r32157后json间不需要分隔符，r32157前json间用分号分隔。
 
 可选参数:
@@ -60,9 +61,9 @@ json也可以写在文件中，假如./input.json包含了上述两个请求，-
 rpc_press启动后会默认在8888端口启动一个dummy server，用于观察rpc_press本身的运行情况：
 
 ```
-./rpc_press -proto=echo.proto -service=example.EchoService -method=Echo -server=0.0.0.0:8002 -input=./input.json -duration=0 -qps=100
+./rpc_press -proto=echo.proto -method=example.EchoService.Echo -server=0.0.0.0:8002 -input=./input.json -duration=0 -qps=100
 TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:733] Server[dummy_servers] is serving on port=8888.
-TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:742] Check out http://db-rpc-dev00.db01.baidu.com:8888 in your web browser.</code>
+TRACE: 01-30 16:10:04:   * 0 src/brpc/server.cpp:742] Check out http://xxx.com:8888 in your web browser.</code>
 ```
 
 dummy_server启动时会在终端打印日志，一般按住ctrl点击那个链接可以直接打开对应的内置服务页面，就像这样：

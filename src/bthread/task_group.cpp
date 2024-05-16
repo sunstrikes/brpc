@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2012 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Tue Jul 10 17:40:58 CST 2012
 
 #include <sys/types.h>
@@ -37,7 +40,7 @@
 namespace bthread {
 
 static const bthread_attr_t BTHREAD_ATTR_TASKGROUP = {
-    BTHREAD_STACKTYPE_UNKNOWN, 0, NULL };
+    BTHREAD_STACKTYPE_UNKNOWN, 0, NULL, BTHREAD_TAG_INVALID };
 
 static bool pass_bool(const char*, bool) { return true; }
 
@@ -54,7 +57,10 @@ const bool ALLOW_UNUSED dummy_show_per_worker_usage_in_vars =
     ::GFLAGS_NS::RegisterFlagValidator(&FLAGS_show_per_worker_usage_in_vars,
                                     pass_bool);
 
-__thread TaskGroup* tls_task_group = NULL;
+BAIDU_VOLATILE_THREAD_LOCAL(TaskGroup*, tls_task_group, NULL);
+// Sync with TaskMeta::local_storage when a bthread is created or destroyed.
+// During running, the two fields may be inconsistent, use tls_bls as the
+// groundtruth.
 __thread LocalStorage tls_bls = BTHREAD_LOCAL_STORAGE_INITIALIZER;
 
 // defined in bthread/key.cpp
@@ -62,13 +68,22 @@ extern void return_keytable(bthread_keytable_pool_t*, KeyTable*);
 
 // [Hacky] This is a special TLS set by bthread-rpc privately... to save
 // overhead of creation keytable, may be removed later.
-BAIDU_THREAD_LOCAL void* tls_unique_user_ptr = NULL;
+BAIDU_VOLATILE_THREAD_LOCAL(void*, tls_unique_user_ptr, NULL);
 
 const TaskStatistics EMPTY_STAT = { 0, 0 };
 
 const size_t OFFSET_TABLE[] = {
 #include "bthread/offset_inl.list"
 };
+
+void* (*g_create_span_func)() = NULL;
+
+void* run_create_span_func() {
+    if (g_create_span_func) {
+        return g_create_span_func();
+    }
+    return tls_bls.rpcz_parent_span;
+}
 
 int TaskGroup::get_attr(bthread_t tid, bthread_attr_t* out) {
     TaskMeta* const m = address_meta(tid);
@@ -140,7 +155,7 @@ void TaskGroup::run_main_task() {
     bvar::PassiveStatus<double> cumulated_cputime(
         get_cumulated_cputime_from_this, this);
     std::unique_ptr<bvar::PerSecond<bvar::PassiveStatus<double> > > usage_bvar;
-    
+
     TaskGroup* dummy = this;
     bthread_t tid;
     while (wait_task(&tid)) {
@@ -163,16 +178,12 @@ void TaskGroup::run_main_task() {
                              (name, &cumulated_cputime, 1));
         }
     }
-    // stop_main_task() was called.
     // Don't forget to add elapse of last wait_task.
     current_task()->stat.cputime_ns += butil::cpuwide_time_ns() - _last_run_ns;
 }
 
 TaskGroup::TaskGroup(TaskControl* c)
     :
-#ifndef NDEBUG
-    _sched_recursive_guard(0),
-#endif
     _cur_meta(NULL)
     , _control(c)
     , _num_nosignal(0)
@@ -182,15 +193,18 @@ TaskGroup::TaskGroup(TaskControl* c)
     , _nswitch(0)
     , _last_context_remained(NULL)
     , _last_context_remained_arg(NULL)
-    , _pl(NULL) 
+    , _pl(NULL)
     , _main_stack(NULL)
     , _main_tid(0)
     , _remote_num_nosignal(0)
     , _remote_nsignaled(0)
+#ifndef NDEBUG
+    , _sched_recursive_guard(0)
+#endif
+    , _tag(BTHREAD_TAG_DEFAULT)
 {
     _steal_seed = butil::fast_rand();
     _steal_offset = OFFSET_TABLE[_steal_seed % ARRAY_SIZE(OFFSET_TABLE)];
-    _pl = &c->_pl[butil::fmix64(pthread_numeric_id()) % TaskControl::PARKING_LOT_NUM];
     CHECK(c);
 }
 
@@ -224,19 +238,13 @@ int TaskGroup::init(size_t runqueue_capacity) {
         LOG(FATAL) << "Fail to get TaskMeta";
         return -1;
     }
+    m->sleep_failed = false;
     m->stop = false;
     m->interrupted = false;
     m->about_to_quit = false;
     m->fn = NULL;
     m->arg = NULL;
-    // In current implementation, even if we set m->local_storage to empty,
-    // everything should be fine because a non-worker pthread never context
-    // switches to a bthread, inconsistency between m->local_storage and tls_bls
-    // does not result in bug. However to avoid potential future bug,
-    // TaskMeta.local_storage is better to be sync with tls_bls otherwise
-    // context switching back to this main bthread will restore tls_bls
-    // with NULL values which is incorrect.
-    m->local_storage = tls_bls;
+    m->local_storage = LOCAL_STORAGE_INIT;
     m->cpuwide_start_ns = butil::cpuwide_time_ns();
     m->stat = EMPTY_STAT;
     m->attr = BTHREAD_ATTR_TASKGROUP;
@@ -260,7 +268,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
             RemainedFn fn = g->_last_context_remained;
             g->_last_context_remained = NULL;
             fn(g->_last_context_remained_arg);
-            g = tls_task_group;
+            g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
         }
 
 #ifndef NDEBUG
@@ -276,7 +284,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // user function is never called, the variables will be unchanged
         // however they'd better reflect failures because the task is stopped
         // abnormally.
-        
+
         // Meta and identifier of the task is persistent in this run.
         TaskMeta* const m = g->_cur_meta;
 
@@ -287,25 +295,22 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
             g->_control->exposed_pending_time() <<
                 (butil::cpuwide_time_ns() - m->cpuwide_start_ns) / 1000L;
         }
-        
+
         // Not catch exceptions except ExitException which is for implementing
-        // bthread_exit(). User code is intended to crash when an exception is 
-        // not caught explicitly. This is consistent with other threading 
+        // bthread_exit(). User code is intended to crash when an exception is
+        // not caught explicitly. This is consistent with other threading
         // libraries.
         void* thread_return;
         try {
             thread_return = m->fn(m->arg);
         } catch (ExitException& e) {
             thread_return = e.value();
-        } 
-        
-        // Group is probably changed
-        g = tls_task_group;
+        }
 
         // TODO: Save thread_return
         (void)thread_return;
 
-        // Logging must be done before returning the keytable, since the logging lib 
+        // Logging must be done before returning the keytable, since the logging lib
         // use bthread local storage internally, or will cause memory leak.
         // FIXME: the time from quiting fn to here is not counted into cputime
         if (m->attr.flags & BTHREAD_LOG_START_AND_FINISH) {
@@ -316,14 +321,18 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // Clean tls variables, must be done before changing version_butex
         // otherwise another thread just joined this thread may not see side
         // effects of destructing tls variables.
-        KeyTable* kt = m->local_storage.keytable;
+        KeyTable* kt = tls_bls.keytable;
         if (kt != NULL) {
             return_keytable(m->attr.keytable_pool, kt);
             // After deletion: tls may be set during deletion.
-            m->local_storage.keytable = NULL;
             tls_bls.keytable = NULL;
+            m->local_storage.keytable = NULL; // optional
         }
-        
+
+        // During running the function in TaskMeta and deleting the KeyTable in
+        // return_KeyTable, the group is probably changed.
+        g =  BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+
         // Increase the version and wake up all joiners, if resulting version
         // is 0, change it to 1 to make bthread_t never be 0. Any access
         // or join to the bthread after changing version will be rejected.
@@ -337,11 +346,12 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         butex_wake_except(m->version_butex, 0);
 
         g->_control->_nbthreads << -1;
+        g->_control->tag_nbthreads(g->tag()) << -1;
         g->set_remained(TaskGroup::_release_last_context, m);
         ending_sched(&g);
-        
+
     } while (g->_cur_meta->tid != g->_main_tid);
-    
+
     // Was called from a pthread and we don't have BTHREAD_STACKTYPE_PTHREAD
     // tasks to run, quit for more tasks.
 }
@@ -373,6 +383,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
         return ENOMEM;
     }
     CHECK(m->current_waiter.load(butil::memory_order_relaxed) == NULL);
+    m->sleep_failed = false;
     m->stop = false;
     m->interrupted = false;
     m->about_to_quit = false;
@@ -381,6 +392,9 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     CHECK(m->stack == NULL);
     m->attr = using_attr;
     m->local_storage = LOCAL_STORAGE_INIT;
+    if (using_attr.flags & BTHREAD_INHERIT_SPAN) {
+        m->local_storage.rpcz_parent_span = run_create_span_func();
+    }
     m->cpuwide_start_ns = start_ns;
     m->stat = EMPTY_STAT;
     m->tid = make_tid(*m->version_butex, slot);
@@ -391,6 +405,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
 
     TaskGroup* g = *pg;
     g->_control->_nbthreads << 1;
+    g->_control->tag_nbthreads(g->tag()) << 1;
     if (g->is_current_pthread_task()) {
         // never create foreground task in pthread.
         g->ready_to_run(m->tid, (using_attr.flags & BTHREAD_NOSIGNAL));
@@ -428,6 +443,7 @@ int TaskGroup::start_background(bthread_t* __restrict th,
         return ENOMEM;
     }
     CHECK(m->current_waiter.load(butil::memory_order_relaxed) == NULL);
+    m->sleep_failed = false;
     m->stop = false;
     m->interrupted = false;
     m->about_to_quit = false;
@@ -436,6 +452,9 @@ int TaskGroup::start_background(bthread_t* __restrict th,
     CHECK(m->stack == NULL);
     m->attr = using_attr;
     m->local_storage = LOCAL_STORAGE_INIT;
+    if (using_attr.flags & BTHREAD_INHERIT_SPAN) {
+        m->local_storage.rpcz_parent_span = run_create_span_func();
+    }
     m->cpuwide_start_ns = start_ns;
     m->stat = EMPTY_STAT;
     m->tid = make_tid(*m->version_butex, slot);
@@ -444,6 +463,7 @@ int TaskGroup::start_background(bthread_t* __restrict th,
         LOG(INFO) << "Started bthread " << m->tid;
     }
     _control->_nbthreads << 1;
+    _control->tag_nbthreads(tag()) << 1;
     if (REMOTE) {
         ready_to_run_remote(m->tid, (using_attr.flags & BTHREAD_NOSIGNAL));
     } else {
@@ -588,9 +608,11 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     // Switch to the task
     if (__builtin_expect(next_meta != cur_meta, 1)) {
         g->_cur_meta = next_meta;
+        // Switch tls_bls
+        cur_meta->local_storage = tls_bls;
         tls_bls = next_meta->local_storage;
 
-        // Logging must be done after switching the local storage, since the logging lib 
+        // Logging must be done after switching the local storage, since the logging lib
         // use bthread local storage internally, or will cause memory leak.
         if ((cur_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH) ||
             (next_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH)) {
@@ -602,7 +624,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
             if (next_meta->stack != cur_meta->stack) {
                 jump_stack(cur_meta->stack, next_meta->stack);
                 // probably went to another group, need to assign g again.
-                g = tls_task_group;
+                g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             }
 #ifndef NDEBUG
             else {
@@ -621,12 +643,13 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
         RemainedFn fn = g->_last_context_remained;
         g->_last_context_remained = NULL;
         fn(g->_last_context_remained_arg);
-        g = tls_task_group;
+        g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
     }
 
     // Restore errno
     errno = saved_errno;
-    tls_unique_user_ptr = saved_unique_user_ptr;
+    // tls_unique_user_ptr probably changed.
+    BAIDU_SET_VOLATILE_THREAD_LOCAL(tls_unique_user_ptr, saved_unique_user_ptr);
 
 #ifndef NDEBUG
     --g->_sched_recursive_guard;
@@ -651,7 +674,7 @@ void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
         const int additional_signal = _num_nosignal;
         _num_nosignal = 0;
         _nsignaled += 1 + additional_signal;
-        _control->signal_task(1 + additional_signal);
+        _control->signal_task(1 + additional_signal, _tag);
     }
 }
 
@@ -660,7 +683,7 @@ void TaskGroup::flush_nosignal_tasks() {
     if (val) {
         _num_nosignal = 0;
         _nsignaled += val;
-        _control->signal_task(val);
+        _control->signal_task(val, _tag);
     }
 }
 
@@ -681,7 +704,7 @@ void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
         _remote_num_nosignal = 0;
         _remote_nsignaled += 1 + additional_signal;
         _remote_rq._mutex.unlock();
-        _control->signal_task(1 + additional_signal);
+        _control->signal_task(1 + additional_signal, _tag);
     }
 }
 
@@ -694,7 +717,7 @@ void TaskGroup::flush_nosignal_tasks_remote_locked(butil::Mutex& locked_mutex) {
     _remote_num_nosignal = 0;
     _remote_nsignaled += val;
     locked_mutex.unlock();
-    _control->signal_task(val);
+    _control->signal_task(val, _tag);
 }
 
 void TaskGroup::ready_to_run_general(bthread_t tid, bool nosignal) {
@@ -731,7 +754,9 @@ struct SleepArgs {
 static void ready_to_run_from_timer_thread(void* arg) {
     CHECK(tls_task_group == NULL);
     const SleepArgs* e = static_cast<const SleepArgs*>(arg);
-    e->group->control()->choose_one_group()->ready_to_run_remote(e->tid);
+    auto g = e->group;
+    auto tag = g->tag();
+    g->control()->choose_one_group(tag)->ready_to_run_remote(e->tid);
 }
 
 void TaskGroup::_add_sleep_event(void* void_args) {
@@ -740,18 +765,19 @@ void TaskGroup::_add_sleep_event(void* void_args) {
     // will be gone.
     SleepArgs e = *static_cast<SleepArgs*>(void_args);
     TaskGroup* g = e.group;
-    
+
     TimerThread::TaskId sleep_id;
     sleep_id = get_global_timer_thread()->schedule(
         ready_to_run_from_timer_thread, void_args,
         butil::microseconds_from_now(e.timeout_us));
 
     if (!sleep_id) {
-        // fail to schedule timer, go back to previous thread.
+        e.meta->sleep_failed = true;
+        // Fail to schedule timer, go back to previous thread.
         g->ready_to_run(e.tid);
         return;
     }
-    
+
     // Set TaskMeta::current_sleep which is for interruption.
     const uint32_t given_ver = get_version(e.tid);
     {
@@ -789,6 +815,12 @@ int TaskGroup::usleep(TaskGroup** pg, uint64_t timeout_us) {
     g->set_remained(_add_sleep_event, &e);
     sched(pg);
     g = *pg;
+    if (e.meta->sleep_failed) {
+        // Fail to schedule timer, return error.
+        e.meta->sleep_failed = false;
+        errno = ESTOP;
+        return -1;
+    }
     e.meta->current_sleep = 0;
     if (e.meta->interrupted) {
         // Race with set and may consume multiple interruptions, which are OK.
@@ -846,7 +878,7 @@ static int set_butex_waiter(bthread_t tid, ButexWaiter* w) {
 // by race conditions.
 // TODO: bthreads created by BTHREAD_ATTR_PTHREAD blocking on bthread_usleep()
 // can't be interrupted.
-int TaskGroup::interrupt(bthread_t tid, TaskControl* c) {
+int TaskGroup::interrupt(bthread_t tid, TaskControl* c, bthread_tag_t tag) {
     // Consume current_waiter in the TaskMeta, wake it up then set it back.
     ButexWaiter* w = NULL;
     uint64_t sleep_id = 0;
@@ -874,7 +906,7 @@ int TaskGroup::interrupt(bthread_t tid, TaskControl* c) {
                 if (!c) {
                     return EINVAL;
                 }
-                c->choose_one_group()->ready_to_run_remote(tid);
+                c->choose_one_group(tag)->ready_to_run_remote(tid);
             }
         }
     }
@@ -930,7 +962,7 @@ void print_task(std::ostream& os, bthread_t tid) {
            << "\narg=" << (void*)arg
            << "\nattr={stack_type=" << attr.stack_type
            << " flags=" << attr.flags
-           << " keytable_pool=" << attr.keytable_pool 
+           << " keytable_pool=" << attr.keytable_pool
            << "}\nhas_tls=" << has_tls
            << "\nuptime_ns=" << butil::cpuwide_time_ns() - cpuwide_start_ns
            << "\ncputime_ns=" << stat.cputime_ns

@@ -1,20 +1,19 @@
-/* Copyright (c) 2017 Baidu, Inc.
- 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-   
-       http://www.apache.org/licenses/LICENSE-2.0
-  
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-
-   Author: Ge,Jun (gejun@baidu.com)
-   Date: Sun Aug 20 11:39:01 CST 2017
-*/
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #ifndef BUTIL_SSL_COMPAT_H
 #define BUTIL_SSL_COMPAT_H
@@ -22,7 +21,7 @@
 #include <openssl/ssl.h>
 #include <openssl/opensslv.h>
 
-/* Provide functions added in newer openssl but missing in older versions */
+/* Provide functions added in newer openssl but missing in older versions or boringssl */
 
 #if defined(__cplusplus) || __STDC_VERSION__ >= 199901L/*C99*/
 #define BRPC_INLINE inline
@@ -325,7 +324,7 @@ BRPC_INLINE int RSA_bits(const RSA *r) {
 
 #endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
 
-#if OPENSSL_VERSION_NUMBER < 0x0090801fL
+#if OPENSSL_VERSION_NUMBER < 0x0090801fL || defined (OPENSSL_IS_BORINGSSL)
 BRPC_INLINE BIGNUM* get_rfc2409_prime_1024(BIGNUM* bn) {
     static const unsigned char RFC2409_PRIME_1024[] = {
         0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xC9,0x0F,0xDA,0xA2,
@@ -517,10 +516,39 @@ BRPC_INLINE int EVP_PKEY_base_id(const EVP_PKEY *pkey) {
     return EVP_PKEY_type(pkey->type);
 }
 
-BRPC_INLINE int EVP_PKEY_base_id(const EVP_PKEY *pkey) {
-    return EVP_PKEY_type(pkey->type);
+#endif /* OPENSSL_VERSION_NUMBER < 0x0090801fL || OPENSSL_IS_BORINGSSL */
+
+#if defined(OPENSSL_IS_BORINGSSL)
+BRPC_INLINE int BIO_fd_non_fatal_error(int err) {
+    if (
+#ifdef EWOULDBLOCK
+        err == EWOULDBLOCK ||
+#endif
+#ifdef WSAEWOULDBLOCK
+        err == WSAEWOULDBLOCK ||
+#endif
+#ifdef ENOTCONN
+        err == ENOTCONN ||
+#endif
+#ifdef EINTR
+        err == EINTR ||
+#endif
+#ifdef EAGAIN
+        err == EAGAIN ||
+#endif
+#ifdef EPROTO
+        err == EPROTO ||
+#endif
+#ifdef EINPROGRESS
+        err == EINPROGRESS ||
+#endif
+#ifdef EALREADY
+        err == EALREADY ||
+#endif
+        0) {
+        return 1;
+    }
+    return 0;
 }
-
-#endif /* OPENSSL_VERSION_NUMBER < 0x0090801fL */
-
+#endif /*OPENSSL_IS_BORINGSSL*/
 #endif /* BUTIL_SSL_COMPAT_H */

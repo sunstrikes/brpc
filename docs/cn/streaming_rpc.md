@@ -1,3 +1,5 @@
+[English version](../en/streaming_rpc.md)
+
 # 概述
 
 在一些应用场景中， client或server需要向对面发送大量数据，这些数据非常大或者持续地在产生以至于无法放在一个RPC的附件中。比如一个分布式系统的不同节点间传递replica或snapshot。client/server之间虽然可以通过多次RPC把数据切分后传输过去，但存在如下问题：
@@ -17,7 +19,7 @@ Streaming RPC保证：
 
 目前的实现还没有自动切割过大的消息，同一个tcp连接上的多个Stream之间可能有[Head-of-line blocking](https://en.wikipedia.org/wiki/Head-of-line_blocking)问题，请尽量避免过大的单个消息，实现自动切割后我们会告知并更新文档。
 
-例子见[example/streaming_echo_c++](https://github.com/brpc/brpc/tree/master/example/streaming_echo_c++/)。
+例子见[example/streaming_echo_c++](https://github.com/apache/brpc/tree/master/example/streaming_echo_c++/)。
 
 # 建立Stream
 
@@ -40,12 +42,12 @@ struct StreamOptions
     // default: -1
     long idle_timeout_ms;
      
-    // How many messages at most passed to handler->on_received_messages
-    // default: 1
-    size_t max_messages_size;
+    // Maximum messages in batch passed to handler->on_received_messages
+    // default: 128
+    size_t messages_in_batch;
  
-    // Handle input message, if handler is NULL, the remote side is not allowd to
-    // write any message, who will get EBADF on writting
+    // Handle input message, if handler is NULL, the remote side is not allowed to
+    // write any message, who will get EBADF on writing
     // default: NULL
     StreamInputHandler* handler;
 };

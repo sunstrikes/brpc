@@ -1,18 +1,24 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang (jiangrujie@baidu.com)
+
+
+#include <openssl/bio.h>
+#ifndef USE_MESALINK
 
 #include <sys/socket.h>                // recv
 #include <openssl/ssl.h>
@@ -207,7 +213,7 @@ void ExtractHostnames(X509* x, std::vector<std::string>* hostnames) {
     STACK_OF(GENERAL_NAME)* names = (STACK_OF(GENERAL_NAME)*)
             X509_get_ext_d2i(x, NID_subject_alt_name, NULL, NULL);
     if (names) {
-        for (int i = 0; i < sk_GENERAL_NAME_num(names); i++) {
+        for (size_t i = 0; i < static_cast<size_t>(sk_GENERAL_NAME_num(names)); i++) {
             char* str = NULL;
             GENERAL_NAME* name = sk_GENERAL_NAME_value(names, i);
             if (name->type == GEN_DNS) {
@@ -315,7 +321,7 @@ static int LoadCertificate(SSL_CTX* ctx,
         return -1;
     }
     
-    // Load the main certficate
+    // Load the main certificate
     if (SSL_CTX_use_certificate(ctx, x.get()) != 1) {
         LOG(ERROR) << "Fail to load " << certificate << ": "
                    << SSLError(ERR_get_error());
@@ -345,7 +351,7 @@ static int LoadCertificate(SSL_CTX* ctx,
     if (err != 0 && (ERR_GET_LIB(err) != ERR_LIB_PEM
                      || ERR_GET_REASON(err) != PEM_R_NO_START_LINE)) {
         LOG(ERROR) << "Fail to read chain certificate in "
-                   << certificate << ": " << SSLError(ERR_get_error());
+                   << certificate << ": " << SSLError(err);
         return -1;
     }
     ERR_clear_error();
@@ -436,11 +442,41 @@ static int SetSSLOptions(SSL_CTX* ctx, const std::string& ciphers,
     return 0;
 }
 
-SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options) {
-    if (!options.enable) {
-        return NULL;
+static int ServerALPNCallback(
+        SSL* ssl, const unsigned char** out, unsigned char* outlen,
+        const unsigned char* in, unsigned int inlen, void* arg) {
+    const std::string* alpns = static_cast<const std::string*>(arg);
+    if (alpns == nullptr) {
+        return SSL_TLSEXT_ERR_NOACK;
     }
 
+    // Use OpenSSL standard select API.
+    int select_result = SSL_select_next_proto(
+            const_cast<unsigned char**>(out), outlen, 
+            reinterpret_cast<const unsigned char*>(alpns->data()), alpns->size(),
+            in, inlen);
+    return (select_result == OPENSSL_NPN_NEGOTIATED) 
+                ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
+
+static int SetServerALPNCallback(SSL_CTX* ssl_ctx, const std::string* alpns) {
+    if (ssl_ctx == nullptr) {
+        LOG(ERROR) << "Fail to set server ALPN callback, ssl_ctx is nullptr.";
+        return -1;
+    }
+
+    // Server set alpn callback when openssl version is more than 1.0.2
+#if (OPENSSL_VERSION_NUMBER >= SSL_VERSION_NUMBER(1, 0, 2))
+    SSL_CTX_set_alpn_select_cb(ssl_ctx, ServerALPNCallback,
+            const_cast<std::string*>(alpns));
+#else
+    LOG(WARNING) << "OpenSSL version=" << OPENSSL_VERSION_STR 
+            << " is lower than 1.0.2, ignore server alpn.";
+#endif
+    return 0;
+}
+
+SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options) {
     std::unique_ptr<SSL_CTX, FreeSSLCTX> ssl_ctx(
         SSL_CTX_new(SSLv23_client_method()));
     if (!ssl_ctx) {
@@ -462,6 +498,14 @@ SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options) {
         return NULL;
     }
 
+    if (!options.alpn_protocols.empty()) {
+        std::vector<unsigned char> alpn_list;
+        if (!BuildALPNProtocolList(options.alpn_protocols, alpn_list)) {
+            return NULL;
+        }
+        SSL_CTX_set_alpn_protos(ssl_ctx.get(), alpn_list.data(), alpn_list.size());
+    }
+
     SSL_CTX_set_session_cache_mode(ssl_ctx.get(), SSL_SESS_CACHE_CLIENT);
     return ssl_ctx.release();
 }
@@ -469,6 +513,7 @@ SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options) {
 SSL_CTX* CreateServerSSLContext(const std::string& certificate,
                                 const std::string& private_key,
                                 const ServerSSLOptions& options,
+                                const std::string* alpns,
                                 std::vector<std::string>* hostnames) {
     std::unique_ptr<SSL_CTX, FreeSSLCTX> ssl_ctx(
         SSL_CTX_new(SSLv23_server_method()));
@@ -520,6 +565,12 @@ SSL_CTX* CreateServerSSLContext(const std::string& certificate,
 
 #endif  // OPENSSL_NO_DH
 
+    // Set ALPN callback to choose application protocol when alpns is not empty.
+    if (alpns != nullptr && !alpns->empty()) {
+        if (SetServerALPNCallback(ssl_ctx.get(), alpns) != 0) {
+            return NULL; 
+        }
+    }
     return ssl_ctx.release();
 }
 
@@ -549,14 +600,18 @@ SSL* CreateSSLSession(SSL_CTX* ctx, SocketId id, int fd, bool server_mode) {
 }
 
 void AddBIOBuffer(SSL* ssl, int fd, int bufsize) {
-    BIO* rbio = BIO_new(BIO_f_buffer());
+#if defined(OPENSSL_IS_BORINGSSL)
+    BIO *rbio = BIO_new(BIO_s_mem());
+    BIO *wbio = BIO_new(BIO_s_mem());
+#else
+    BIO *rbio = BIO_new(BIO_f_buffer());
     BIO_set_buffer_size(rbio, bufsize);
+    BIO *wbio = BIO_new(BIO_f_buffer());
+    BIO_set_buffer_size(wbio, bufsize);
+#endif
     BIO* rfd = BIO_new(BIO_s_fd());
     BIO_set_fd(rfd, fd, 0);
     rbio  = BIO_push(rbio, rfd);
-
-    BIO* wbio = BIO_new(BIO_f_buffer());
-    BIO_set_buffer_size(wbio, bufsize);
     BIO* wfd = BIO_new(BIO_s_fd());
     BIO_set_fd(wfd, fd, 0);
     wbio = BIO_push(wbio, wfd);
@@ -770,51 +825,115 @@ int SSLDHInit() {
     return 0;
 }
 
-} // namespace brpc
-
-std::ostream& operator<<(std::ostream& os, SSL* ssl) {
-    os << "[SSL HANDSHAKE]"
-       << "\n* cipher: " << SSL_get_cipher(ssl)
-       << "\n* protocol: " << SSL_get_version(ssl)
-       << "\n* verify: " << (SSL_get_verify_mode(ssl) & SSL_VERIFY_PEER
-                             ? "success" : "none")
-       << "\n";
-
-    X509* cert = SSL_get_peer_certificate(ssl);
-    if (cert) {
-        os << "\n" << cert;
+static std::string GetNextLevelSeparator(const char* sep) {
+    if (sep[0] != '\n') {
+        return sep;
     }
-    return os;
+    const size_t left_len = strlen(sep + 1);
+    if (left_len == 0) {
+        return "\n ";
+    }
+    std::string new_sep;
+    new_sep.reserve(left_len * 2 + 1);
+    new_sep.append(sep, left_len + 1);
+    new_sep.append(sep + 1, left_len);
+    return new_sep;
 }
 
-std::ostream& operator<<(std::ostream& os, X509* cert) {
+void Print(std::ostream& os, SSL* ssl, const char* sep) {
+    os << "cipher=" << SSL_get_cipher(ssl) << sep
+       << "protocol=" << SSL_get_version(ssl) << sep
+       << "verify=" << (SSL_get_verify_mode(ssl) & SSL_VERIFY_PEER
+                        ? "success" : "none");
+    X509* cert = SSL_get_peer_certificate(ssl);
+    if (cert) {
+        os << sep << "peer_certificate={";
+        const std::string new_sep = GetNextLevelSeparator(sep);
+        if (sep[0] == '\n') {
+            os << new_sep;
+        }
+        Print(os, cert, new_sep.c_str());
+        if (sep[0] == '\n') {
+            os << sep;
+        }
+        os << '}';
+    }
+}
+
+void Print(std::ostream& os, X509* cert, const char* sep) {
     BIO* buf = BIO_new(BIO_s_mem());
     if (buf == NULL) {
-        return os;
+        return;
     }
-    BIO_printf(buf, "[CERTIFICATE]");
-
-    BIO_printf(buf, "\n* subject: ");
+    BIO_printf(buf, "subject=");
     X509_NAME_print(buf, X509_get_subject_name(cert), 0);
-    BIO_printf(buf, "\n* start date: ");
+    BIO_printf(buf, "%sstart_date=", sep);
     ASN1_TIME_print(buf, X509_get_notBefore(cert));
-    BIO_printf(buf, "\n* expire date: ");
+    BIO_printf(buf, "%sexpire_date=", sep);
     ASN1_TIME_print(buf, X509_get_notAfter(cert));
 
-    BIO_printf(buf, "\n* common name: ");
+    BIO_printf(buf, "%scommon_name=", sep);
     std::vector<std::string> hostnames;
     brpc::ExtractHostnames(cert, &hostnames);
     for (size_t i = 0; i < hostnames.size(); ++i) {
-        BIO_printf(buf, "%s; ", hostnames[i].c_str());
+        BIO_printf(buf, "%s;", hostnames[i].c_str());
     }
 
-    BIO_printf(buf, "\n* issuer: ");
+    BIO_printf(buf, "%sissuer=", sep);
     X509_NAME_print(buf, X509_get_issuer_name(cert), 0);
-
-    BIO_printf(buf, "\n");
 
     char* bufp = NULL;
     int len = BIO_get_mem_data(buf, &bufp);
     os << butil::StringPiece(bufp, len);
-    return os;
 }
+
+std::string ALPNProtocolToString(const AdaptiveProtocolType& protocol) {
+    butil::StringPiece name = protocol.name();
+    // Default use http 1.1 version
+    if (name.starts_with("http")) {
+        name.set("http/1.1");
+    }
+
+    // ALPN extension uses 1 byte to record the protocol length
+    // and it's maximum length is 255.
+    if (name.size() > CHAR_MAX) {
+        name = name.substr(0, CHAR_MAX); 
+    }
+
+    char length = static_cast<char>(name.size());
+    return std::string(&length, 1) + name.data(); 
+}
+
+bool BuildALPNProtocolList(
+    const std::vector<std::string>& alpn_protocols,
+    std::vector<unsigned char>& result
+) {
+    size_t alpn_list_length = 0;
+    for (const auto& alpn_protocol : alpn_protocols) {
+        if (alpn_protocol.size() > UCHAR_MAX) {
+            LOG(ERROR) << "Fail to build ALPN procotol list: "
+                       << "protocol name length " << alpn_protocol.size() << " too long, "
+                       << "max 255 supported.";
+            return false;
+        }
+        alpn_list_length += alpn_protocol.size() + 1;
+    }
+
+    result.resize(alpn_list_length);
+    for (size_t curr = 0, i = 0; i < alpn_protocols.size(); i++) {
+        result[curr++] = static_cast<unsigned char>(
+            alpn_protocols[i].size()
+        );
+        std::copy(
+            alpn_protocols[i].begin(),
+            alpn_protocols[i].end(),
+            result.begin() + curr
+        );
+        curr += alpn_protocols[i].size();
+    }
+    return true;
+}
+
+} // namespace brpc
+
+#endif // USE_MESALINK

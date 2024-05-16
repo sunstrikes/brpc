@@ -1,10 +1,19 @@
-// Copyright (c) 2011 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
 //
-// string_printf_impl, string_printf, string_appendf were taken from
-// https://github.com/facebook/folly/blob/master/folly/String.cpp
-// with minor changes:
-//   - coding style
-//   - replace exceptions with return code
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <stdio.h>                               // vsnprintf
 #include <string.h>                              // strlen
@@ -58,24 +67,49 @@ inline int string_printf_impl(std::string& output, const char* format,
     }
     return 0;
 }
+
+inline int string_printf_impl(std::string& output,  size_t hint,
+                              const char* format, va_list args) {
+    if (hint > output.capacity()) {
+        output.reserve(hint);
+    }
+    return string_printf_impl(output,  format, args);
+}
 }  // end anonymous namespace
 
 std::string string_printf(const char* format, ...) {
     // snprintf will tell us how large the output buffer should be, but
-    // we then have to call it a second time, which is costly.  By
+    // we then have to call it a second time, which is costly. By
     // guestimating the final size, we avoid the double snprintf in many
-    // cases, resulting in a performance win.  We use this constructor
+    // cases, resulting in a performance win. We use this constructor
     // of std::string to avoid a double allocation, though it does pad
-    // the resulting string with nul bytes.  Our guestimation is twice
+    // the resulting string with nul bytes. Our guestimation is twice
     // the format string size, or 32 bytes, whichever is larger.  This
-    // is a hueristic that doesn't affect correctness but attempts to be
+    // is a heuristic that doesn't affect correctness but attempts to be
     // reasonably fast for the most common cases.
     std::string ret;
-    ret.reserve(std::max(32UL, strlen(format) * 2));
-
     va_list ap;
     va_start(ap, format);
-    if (string_printf_impl(ret, format, ap) != 0) {
+    if (string_printf_impl(ret, std::max(32UL, strlen(format) * 2),
+                           format, ap) != 0) {
+        ret.clear();
+    }
+    va_end(ap);
+    return ret;
+}
+
+std::string string_printf(size_t hint_size, const char* format, ...) {
+    // snprintf will tell us how large the output buffer should be, but
+    // we then have to call it a second time, which is costly. By
+    // passing the hint size of formatted string, we avoid the double
+    // snprintf in many cases, resulting in a performance win. We use
+    // this constructor  of std::string to avoid a double allocation,
+    // though it does pad the resulting string with nul bytes.
+    std::string ret;
+    va_list ap;
+    va_start(ap, format);
+    if (string_printf_impl(ret, std::max(hint_size, strlen(format) * 2),
+                           format, ap) != 0) {
         ret.clear();
     }
     va_end(ap);
@@ -87,11 +121,7 @@ std::string string_printf(const char* format, ...) {
 int string_appendf(std::string* output, const char* format, ...) {
     va_list ap;
     va_start(ap, format);
-    const size_t old_size = output->size();
-    const int rc = string_printf_impl(*output, format, ap);
-    if (rc != 0) {
-        output->resize(old_size);
-    }
+    const int rc = string_vappendf(output, format, ap);
     va_end(ap);
     return rc;
 }
@@ -99,21 +129,16 @@ int string_appendf(std::string* output, const char* format, ...) {
 int string_vappendf(std::string* output, const char* format, va_list args) {
     const size_t old_size = output->size();
     const int rc = string_printf_impl(*output, format, args);
-    if (rc == 0) {
-        return 0;
+    if (rc != 0) {
+        output->resize(old_size);
     }
-    output->resize(old_size);
     return rc;
 }
 
 int string_printf(std::string* output, const char* format, ...) {
     va_list ap;
     va_start(ap, format);
-    output->clear();
-    const int rc = string_printf_impl(*output, format, ap);
-    if (rc != 0) {
-        output->clear();
-    }
+    const int rc = string_vprintf(output, format, ap);
     va_end(ap);
     return rc;
 };
@@ -121,12 +146,10 @@ int string_printf(std::string* output, const char* format, ...) {
 int string_vprintf(std::string* output, const char* format, va_list args) {
     output->clear();
     const int rc = string_printf_impl(*output, format, args);
-    if (rc == 0) {
-        return 0;
+    if (rc != 0) {
+        output->clear();
     }
-    output->clear();
     return rc;
 };
-
 
 }  // namespace butil

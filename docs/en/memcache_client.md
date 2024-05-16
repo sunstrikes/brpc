@@ -1,6 +1,6 @@
 [中文版](../cn/memcache_client.md)
 
-[memcached](http://memcached.org/) is a common caching service. In order to access memcached more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the memcached protocol. Check [example/memcache_c++](https://github.com/brpc/brpc/tree/master/example/memcache_c++/) for an example.
+[memcached](http://memcached.org/) is a common caching service. In order to access memcached more conveniently and make full use of bthread's capability of concurrency, brpc directly supports the memcached protocol. Check [example/memcache_c++](https://github.com/apache/brpc/tree/master/example/memcache_c++/) for an example.
 
 **NOTE**: brpc only supports the binary protocol of memcache. There's little benefit to support the textual protocol which is replaced since memcached 1.3. If your memcached is older than 1.3, upgrade to a newer version.
 
@@ -58,7 +58,7 @@ Notes on above code:
 - The class of the request must be `MemcacheRequest`, response must be `MemcacheResponse`, otherwise `CallMethod` fails. `stub` is not necessary, just call `channel.CallMethod` with `method` to NULL.
 - Call `request.XXX()` to add an operation, where `XXX` is `Set` in this example. Multiple operations inside a request are sent to a memcached server together (often referred to as "pipeline mode").
 - call `response.PopXXX()` to pop result of an operation from the response, where `XXX` is `Set` in this example. true is returned on success, and false otherwise in which case use `response.LastError()` to get the error message. `XXX` must match the corresponding operation in the request, otherwise the pop is rejected. In above example, a `PopGet` would fail with the error message of "not a GET response".
-- Results of `Pop` are independent from the RPC result. Even if "a value cannot be put into the memcached", the RPC may still be successful. RPC failure means things like broken connection, timeout etc. If the business logic requires the memcache operations to be succesful, you should test successfulness of both RPC and `PopXXX`.
+- Results of `Pop` are independent from the RPC result. Even if "a value cannot be put into the memcached", the RPC may still be successful. RPC failure means things like broken connection, timeout etc. If the business logic requires the memcache operations to be successful, you should test successfulness of both RPC and `PopXXX`.
 
 Supported operations currently:
 

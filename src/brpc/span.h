@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 // NOTE: RPC users are not supposed to include this file.
 
@@ -67,6 +69,10 @@ public:
     static Span* CreateClientSpan(const std::string& full_method_name,
                                   int64_t base_real_us);
 
+    // Create a span to track start bthread
+    static Span* CreateBthreadSpan(const std::string& full_method_name, 
+                                   int64_t base_real_us);
+
     static void Submit(Span* span, int64_t cpuwide_time_us);
 
     // Set tls parent.
@@ -80,7 +86,7 @@ public:
     void Annotate(const std::string& info);
     // When length <= 0, use strlen instead.
     void AnnotateCStr(const char* cstr, size_t length);
-    
+
     // #child spans, Not O(1)
     size_t CountClientSpans() const;
 
@@ -140,6 +146,7 @@ private:
 
     void dump_and_destroy(size_t round_index);
     void destroy();
+    void traversal(Span*, const std::function<void(Span*)>&) const;
     bvar::CollectorSpeedLimit* speed_limit();
     bvar::CollectorPreprocessor* preprocessor();
 
@@ -177,6 +184,7 @@ private:
 
     Span* _local_parent;
     Span* _next_client;
+    Span* _client_list;
     Span* _tls_next;
 };
 
@@ -229,6 +237,12 @@ inline bool IsTraceable(bool is_upstream_traced) {
     extern bvar::CollectorSpeedLimit g_span_sl;
     return is_upstream_traced ||
         (FLAGS_enable_rpcz && bvar::is_collectable(&g_span_sl));
+}
+
+inline void* CreateBthreadSpan() {
+    const int64_t received_us = butil::cpuwide_time_us();
+    const int64_t base_realtime = butil::gettimeofday_us() - received_us;
+    return Span::CreateBthreadSpan("Bthread", base_realtime);
 }
 
 } // namespace brpc

@@ -1,25 +1,27 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Rujie Jiang(jiangrujie@baidu.com)
-//          Ge,Jun(gejun@baidu.com)
 
 #include <inttypes.h>
 #include <gflags/gflags.h>
 #include "butil/fd_guard.h"                 // fd_guard 
 #include "butil/fd_utility.h"               // make_close_on_exec
 #include "butil/time.h"                     // gettimeofday_us
+#include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/acceptor.h"
 
 
@@ -36,7 +38,10 @@ Acceptor::Acceptor(bthread_keytable_pool_t* pool)
     , _listened_fd(-1)
     , _acception_id(0)
     , _empty_cond(&_map_mutex)
-    , _ssl_ctx(NULL) {
+    , _force_ssl(false)
+    , _ssl_ctx(NULL) 
+    , _use_rdma(false)
+    , _bthread_tag(BTHREAD_TAG_DEFAULT) {
 }
 
 Acceptor::~Acceptor() {
@@ -44,10 +49,17 @@ Acceptor::~Acceptor() {
     Join();
 }
 
-int Acceptor::StartAccept(
-    int listened_fd, int idle_timeout_sec, SSL_CTX* ssl_ctx) {
+int Acceptor::StartAccept(int listened_fd, int idle_timeout_sec,
+                          const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                          bool force_ssl) {
     if (listened_fd < 0) {
         LOG(FATAL) << "Invalid listened_fd=" << listened_fd;
+        return -1;
+    }
+
+    if (!ssl_ctx && force_ssl) {
+        LOG(ERROR) << "Fail to force SSL for all connections "
+                      " because ssl_ctx is NULL";
         return -1;
     }
     
@@ -64,13 +76,15 @@ int Acceptor::StartAccept(
         return -1;
     }
     if (idle_timeout_sec > 0) {
-        if (bthread_start_background(&_close_idle_tid, NULL,
-                                     CloseIdleConnections, this) != 0) {
+        bthread_attr_t tmp = BTHREAD_ATTR_NORMAL;
+        tmp.tag = _bthread_tag;
+        if (bthread_start_background(&_close_idle_tid, &tmp, CloseIdleConnections, this) != 0) {
             LOG(FATAL) << "Fail to start bthread";
             return -1;
         }
     }
     _idle_timeout_sec = idle_timeout_sec;
+    _force_ssl = force_ssl;
     _ssl_ctx = ssl_ctx;
     
     // Creation of _acception_id is inside lock so that OnNewConnections
@@ -78,6 +92,7 @@ int Acceptor::StartAccept(
     SocketOptions options;
     options.fd = listened_fd;
     options.user = this;
+    options.bthread_tag = _bthread_tag;
     options.on_edge_triggered_events = OnNewConnections;
     if (Socket::Create(options, &_acception_id) != 0) {
         // Close-idle-socket thread will be stopped inside destructor
@@ -239,9 +254,10 @@ void Acceptor::ListConnections(std::vector<SocketId>* conn_list) {
 
 void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
     while (1) {
-        struct sockaddr in_addr;
+        struct sockaddr_storage in_addr;
+        bzero(&in_addr, sizeof(in_addr));
         socklen_t in_len = sizeof(in_addr);
-        butil::fd_guard in_fd(accept(acception->fd(), &in_addr, &in_len));
+        butil::fd_guard in_fd(accept(acception->fd(), (sockaddr*)&in_addr, &in_len));
         if (in_fd < 0) {
             // no EINTR because listened fd is non-blocking.
             if (errno == EAGAIN) {
@@ -268,10 +284,21 @@ void Acceptor::OnNewConnectionsUntilEAGAIN(Socket* acception) {
         SocketOptions options;
         options.keytable_pool = am->_keytable_pool;
         options.fd = in_fd;
-        options.remote_side = butil::EndPoint(*(sockaddr_in*)&in_addr);
+        butil::sockaddr2endpoint(&in_addr, in_len, &options.remote_side);
         options.user = acception->user();
-        options.on_edge_triggered_events = InputMessenger::OnNewMessages;
-        options.ssl_ctx = am->_ssl_ctx;
+        options.force_ssl = am->_force_ssl;
+        options.initial_ssl_ctx = am->_ssl_ctx;
+#if BRPC_WITH_RDMA
+        if (am->_use_rdma) {
+            options.on_edge_triggered_events = rdma::RdmaEndpoint::OnNewDataFromTcp;
+        } else {
+#else
+        {
+#endif
+            options.on_edge_triggered_events = InputMessenger::OnNewMessages;
+        }
+        options.use_rdma = am->_use_rdma;
+        options.bthread_tag = am->_bthread_tag;
         if (Socket::Create(options, &socket_id) != 0) {
             LOG(ERROR) << "Fail to create Socket";
             continue;

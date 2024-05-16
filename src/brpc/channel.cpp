@@ -1,26 +1,29 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Rujie Jiang(jiangrujie@baidu.com)
-//          Zhangyi Chen(chenzhangyi01@baidu.com)
 
 #include <inttypes.h>
 #include <google/protobuf/descriptor.h>
 #include <gflags/gflags.h>
+#include <memory>
 #include "butil/time.h"                              // milliseconds_from_now
 #include "butil/logging.h"
+#include "butil/third_party/murmurhash3/murmurhash3.h"
+#include "butil/strings/string_util.h"
 #include "bthread/unstable.h"                        // bthread_timer_add
 #include "brpc/socket_map.h"                         // SocketMapInsert
 #include "brpc/compress.h"
@@ -30,8 +33,8 @@
 #include "brpc/controller.h"
 #include "brpc/channel.h"
 #include "brpc/details/usercode_backup_pool.h"       // TooManyUserCode
+#include "brpc/rdma/rdma_helper.h"
 #include "brpc/policy/esp_authenticator.h"
-
 
 namespace brpc {
 
@@ -43,17 +46,93 @@ ChannelOptions::ChannelOptions()
     , timeout_ms(500)
     , backup_request_ms(-1)
     , max_retry(3)
+    , enable_circuit_breaker(false)
     , protocol(PROTOCOL_BAIDU_STD)
     , connection_type(CONNECTION_TYPE_UNKNOWN)
     , succeed_without_server(true)
     , log_succeed_without_server(true)
+    , use_rdma(false)
     , auth(NULL)
     , retry_policy(NULL)
     , ns_filter(NULL)
 {}
 
+ChannelSSLOptions* ChannelOptions::mutable_ssl_options() {
+    if (!_ssl_options) {
+        _ssl_options.reset(new ChannelSSLOptions);
+    }
+    return _ssl_options.get();
+}
+
+static ChannelSignature ComputeChannelSignature(const ChannelOptions& opt) {
+    if (opt.auth == NULL &&
+        !opt.has_ssl_options() &&
+        opt.connection_group.empty()) {
+        // Returning zeroized result by default is more intuitive for users.
+        return ChannelSignature();
+    }
+    uint32_t seed = 0;
+    std::string buf;
+    buf.reserve(1024);
+    butil::MurmurHash3_x64_128_Context mm_ctx;
+    do {
+        buf.clear();
+        butil::MurmurHash3_x64_128_Init(&mm_ctx, seed);
+
+        if (!opt.connection_group.empty()) {
+            buf.append("|conng=");
+            buf.append(opt.connection_group);
+        }
+        if (opt.auth) {
+            buf.append("|auth=");
+            buf.append((char*)&opt.auth, sizeof(opt.auth));
+        }
+        if (opt.has_ssl_options()) {
+            const ChannelSSLOptions& ssl = opt.ssl_options();
+            buf.push_back('|');
+            buf.append(ssl.ciphers);
+            buf.push_back('|');
+            buf.append(ssl.protocols);
+            buf.push_back('|');
+            buf.append(ssl.sni_name);
+            const VerifyOptions& verify = ssl.verify;
+            buf.push_back('|');
+            buf.append((char*)&verify.verify_depth, sizeof(verify.verify_depth));
+            buf.push_back('|');
+            buf.append(verify.ca_file_path);
+        } else {
+            // All disabled ChannelSSLOptions are the same
+        }
+        if (opt.use_rdma) {
+            buf.append("|rdma");
+        }
+        butil::MurmurHash3_x64_128_Update(&mm_ctx, buf.data(), buf.size());
+        buf.clear();
+    
+        if (opt.has_ssl_options()) {
+            const CertInfo& cert = opt.ssl_options().client_cert;
+            if (!cert.certificate.empty()) {
+                // Certificate may be too long (PEM string) to fit into `buf'
+                butil::MurmurHash3_x64_128_Update(
+                    &mm_ctx, cert.certificate.data(), cert.certificate.size());
+                butil::MurmurHash3_x64_128_Update(
+                    &mm_ctx, cert.private_key.data(), cert.private_key.size());
+            }
+        }
+        // sni_filters has no effect in ChannelSSLOptions
+        ChannelSignature result;
+        butil::MurmurHash3_x64_128_Final(result.data, &mm_ctx);
+        if (result != ChannelSignature()) {
+            // the empty result is reserved for default case and cannot
+            // be used, increment the seed and retry.
+            return result;
+        }
+        ++seed;
+    } while (true);
+}
+
 Channel::Channel(ProfilerLinker)
-    : _server_id((SocketId)-1)
+    : _server_id(INVALID_SOCKET_ID)
     , _serialize_request(NULL)
     , _pack_request(NULL)
     , _get_method_name(NULL)
@@ -61,12 +140,26 @@ Channel::Channel(ProfilerLinker)
 }
 
 Channel::~Channel() {
-    if (_server_id != (SocketId)-1) {
-        SocketMapRemove(SocketMapKey(_server_address,
-                                     _options.ssl_options,
-                                     _options.auth));
+    if (_server_id != INVALID_SOCKET_ID) {
+        const ChannelSignature sig = ComputeChannelSignature(_options);
+        SocketMapRemove(SocketMapKey(_server_address, sig));
     }
 }
+
+#if BRPC_WITH_RDMA
+static bool OptionsAvailableForRdma(const ChannelOptions* opt) {
+    if (opt->has_ssl_options()) {
+        LOG(WARNING) << "Cannot use SSL and RDMA at the same time";
+        return false;
+    }
+    if (!rdma::SupportedByRdma(opt->protocol.name())) {
+        LOG(WARNING) << "Cannot use " << opt->protocol.name()
+                     << " over RDMA";
+        return false;
+    }
+    return true;
+}
+#endif
 
 int Channel::InitChannelOptions(const ChannelOptions* options) {
     if (options) {  // Override default options if user provided one.
@@ -74,14 +167,22 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
     }
     const Protocol* protocol = FindProtocol(_options.protocol);
     if (NULL == protocol || !protocol->support_client()) {
-        if (_options.protocol == PROTOCOL_UNKNOWN) {
-            LOG(ERROR) << "Unknown protocol";
-        } else {
-            LOG(ERROR) << "Channel doesn't support protocol="
-                       << _options.protocol.name();
-        }
+        LOG(ERROR) << "Channel does not support the protocol";
         return -1;
     }
+
+    if (_options.use_rdma) {
+#if BRPC_WITH_RDMA
+        if (!OptionsAvailableForRdma(&_options)) {
+            return -1;
+        }
+        rdma::GlobalRdmaInitializeOrDie();
+#else
+        LOG(WARNING) << "Cannot use rdma since brpc does not compile with rdma";
+        return -1;
+#endif
+    }
+
     _serialize_request = protocol->serialize_request;
     _pack_request = protocol->pack_request;
     _get_method_name = protocol->get_method_name;
@@ -123,17 +224,13 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         if (_options.auth == NULL) {
             _options.auth = policy::global_esp_authenticator();
         }
-    } else if (_options.protocol == brpc::PROTOCOL_HTTP) {
-        if (_raw_server_address.compare(0, 5, "https") == 0) {
-            _options.ssl_options.enable = true;
-            if (_options.ssl_options.sni_name.empty()) {
-                int port;
-                ParseHostAndPortFromURL(_raw_server_address.c_str(),
-                                        &_options.ssl_options.sni_name, &port);
-            }
-        }
     }
 
+    // Normalize connection_group
+    std::string& cg = _options.connection_group;
+    if (!cg.empty() && (::isspace(cg.front()) || ::isspace(cg.back()))) {
+        butil::TrimWhitespace(cg, butil::TRIM_ALL, &cg);
+    }
     return 0;
 }
 
@@ -141,9 +238,13 @@ int Channel::Init(const char* server_addr_and_port,
                   const ChannelOptions* options) {
     GlobalInitializeOrDie();
     butil::EndPoint point;
-    const Protocol* protocol =
-        FindProtocol(options ? options->protocol : _options.protocol);
-    if (protocol != NULL && protocol->parse_server_address != NULL) {
+    const AdaptiveProtocolType& ptype = (options ? options->protocol : _options.protocol);
+    const Protocol* protocol = FindProtocol(ptype);
+    if (protocol == NULL || !protocol->support_client()) {
+        LOG(ERROR) << "Channel does not support the protocol";
+        return -1;
+    }
+    if (protocol->parse_server_address != NULL) {
         if (!protocol->parse_server_address(&point, server_addr_and_port)) {
             LOG(ERROR) << "Fail to parse address=`" << server_addr_and_port << '\'';
             return -1;
@@ -163,17 +264,20 @@ int Channel::Init(const char* server_addr_and_port,
             return -1;
         }
     }
-    _raw_server_address.assign(server_addr_and_port);
-    return Init(point, options);
+    return InitSingle(point, server_addr_and_port, options);
 }
 
 int Channel::Init(const char* server_addr, int port,
                   const ChannelOptions* options) {
     GlobalInitializeOrDie();
     butil::EndPoint point;
-    const Protocol* protocol =
-        FindProtocol(options ? options->protocol : _options.protocol);
-    if (protocol != NULL && protocol->parse_server_address != NULL) {
+    const AdaptiveProtocolType& ptype = (options ? options->protocol : _options.protocol);
+    const Protocol* protocol = FindProtocol(ptype);
+    if (protocol == NULL || !protocol->support_client()) {
+        LOG(ERROR) << "Channel does not support the protocol";
+        return -1;
+    }
+    if (protocol->parse_server_address != NULL) {
         if (!protocol->parse_server_address(&point, server_addr)) {
             LOG(ERROR) << "Fail to parse address=`" << server_addr << '\'';
             return -1;
@@ -186,25 +290,63 @@ int Channel::Init(const char* server_addr, int port,
             return -1;
         }
     }
-    _raw_server_address.assign(server_addr);
-    return Init(point, options);
+    return InitSingle(point, server_addr, options, port);
+}
+
+static int CreateSocketSSLContext(const ChannelOptions& options,
+                                  std::shared_ptr<SocketSSLContext>* ssl_ctx) {
+    if (options.has_ssl_options()) {
+        SSL_CTX* raw_ctx = CreateClientSSLContext(options.ssl_options());
+        if (!raw_ctx) {
+            LOG(ERROR) << "Fail to CreateClientSSLContext";
+            return -1;
+        }
+        *ssl_ctx = std::make_shared<SocketSSLContext>();
+        (*ssl_ctx)->raw_ctx = raw_ctx;
+        (*ssl_ctx)->sni_name = options.ssl_options().sni_name;
+        (*ssl_ctx)->alpn_protocols = options.ssl_options().alpn_protocols;
+    } else {
+        (*ssl_ctx) = NULL;
+    }
+    return 0;
 }
 
 int Channel::Init(butil::EndPoint server_addr_and_port,
                   const ChannelOptions* options) {
+    return InitSingle(server_addr_and_port, "", options);
+}
+
+int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
+                        const char* raw_server_address,
+                        const ChannelOptions* options,
+                        int raw_port) {
     GlobalInitializeOrDie();
     if (InitChannelOptions(options) != 0) {
         return -1;
     }
+    int* port_out = raw_port == -1 ? &raw_port: NULL;
+    ParseURL(raw_server_address, &_scheme, &_service_name, port_out);
+    if (raw_port != -1) {
+        _service_name.append(":").append(std::to_string(raw_port));
+    }
+    if (_options.protocol == brpc::PROTOCOL_HTTP && _scheme == "https") {
+        if (_options.mutable_ssl_options()->sni_name.empty()) {
+            _options.mutable_ssl_options()->sni_name = _service_name;
+        }
+    }
     const int port = server_addr_and_port.port;
-    if (port < 0 || port > 65535) {
+    if (port < 0) {
         LOG(ERROR) << "Invalid port=" << port;
         return -1;
     }
     _server_address = server_addr_and_port;
-    if (SocketMapInsert(SocketMapKey(server_addr_and_port,
-                                     _options.ssl_options,
-                                     _options.auth), &_server_id) != 0) {
+    const ChannelSignature sig = ComputeChannelSignature(_options);
+    std::shared_ptr<SocketSSLContext> ssl_ctx;
+    if (CreateSocketSSLContext(_options, &ssl_ctx) != 0) {
+        return -1;
+    }
+    if (SocketMapInsert(SocketMapKey(server_addr_and_port, sig),
+                        &_server_id, ssl_ctx, _options.use_rdma) != 0) {
         LOG(ERROR) << "Fail to insert into SocketMap";
         return -1;
     }
@@ -222,7 +364,18 @@ int Channel::Init(const char* ns_url,
     if (InitChannelOptions(options) != 0) {
         return -1;
     }
-    LoadBalancerWithNaming* lb = new (std::nothrow) LoadBalancerWithNaming;
+    int raw_port = -1;
+    ParseURL(ns_url, &_scheme, &_service_name, &raw_port);
+    if (raw_port != -1) {
+        _service_name.append(":").append(std::to_string(raw_port));
+    }
+    if (_options.protocol == brpc::PROTOCOL_HTTP && _scheme == "https") {
+        if (_options.mutable_ssl_options()->sni_name.empty()) {
+            _options.mutable_ssl_options()->sni_name = _service_name;
+        }
+    }
+    std::unique_ptr<LoadBalancerWithNaming> lb(new (std::nothrow)
+                                                   LoadBalancerWithNaming);
     if (NULL == lb) {
         LOG(FATAL) << "Fail to new LoadBalancerWithNaming";
         return -1;        
@@ -230,12 +383,16 @@ int Channel::Init(const char* ns_url,
     GetNamingServiceThreadOptions ns_opt;
     ns_opt.succeed_without_server = _options.succeed_without_server;
     ns_opt.log_succeed_without_server = _options.log_succeed_without_server;
-    if (lb->Init(ns_url, lb_name, _options.ns_filter, &ns_opt) != 0) {
-        LOG(ERROR) << "Fail to initialize LoadBalancerWithNaming";
-        delete lb;
+    ns_opt.use_rdma = _options.use_rdma;
+    ns_opt.channel_signature = ComputeChannelSignature(_options);
+    if (CreateSocketSSLContext(_options, &ns_opt.ssl_ctx) != 0) {
         return -1;
     }
-    _lb.reset(lb);
+    if (lb->Init(ns_url, lb_name, _options.ns_filter, &ns_opt) != 0) {
+        LOG(ERROR) << "Fail to initialize LoadBalancerWithNaming";
+        return -1;
+    }
+    _lb.reset(lb.release());
     return 0;
 }
 
@@ -268,8 +425,21 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     }
     // HTTP needs this field to be set before any SetFailed()
     cntl->_request_protocol = _options.protocol;
+    if (_options.protocol.has_param()) {
+        CHECK(cntl->protocol_param().empty());
+        cntl->protocol_param() = _options.protocol.param();
+    }
+    if (_options.protocol == brpc::PROTOCOL_HTTP && (_scheme == "https" || _scheme == "http")) {
+        URI& uri = cntl->http_request().uri();
+        if (uri.host().empty() && !_service_name.empty()) {
+            uri.SetHostAndPort(_service_name);
+        }
+    }
     cntl->_preferred_index = _preferred_index;
     cntl->_retry_policy = _options.retry_policy;
+    if (_options.enable_circuit_breaker) {
+        cntl->add_flag(Controller::FLAGS_ENABLED_CIRCUIT_BREAKER);
+    }
     const CallId correlation_id = cntl->call_id();
     const int rc = bthread_id_lock_and_reset_range(
                     correlation_id, NULL, 2 + cntl->max_retry());
@@ -343,20 +513,20 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     // Share the lb with controller.
     cntl->_lb = _lb;
 
+    // Ensure that serialize_request is done before pack_request in all
+    // possible executions, including:
+    //   HandleSendFailed => OnVersionedRPCReturned => IssueRPC(pack_request)
+    _serialize_request(&cntl->_request_buf, cntl, request);
+    if (cntl->FailedInline()) {
+        // Handle failures caused by serialize_request, and these error_codes
+        // should be excluded from the retry_policy.
+        return cntl->HandleSendFailed();
+    }
     if (FLAGS_usercode_in_pthread &&
         done != NULL &&
         TooManyUserCode()) {
         cntl->SetFailed(ELIMIT, "Too many user code to run when "
                         "-usercode_in_pthread is on");
-        return cntl->HandleSendFailed();
-    }
-    if (cntl->FailedInline()) {
-        // probably failed before RPC, not called until all necessary
-        // parameters in `cntl' are set.
-        return cntl->HandleSendFailed();
-    }
-    _serialize_request(&cntl->_request_buf, cntl, request);
-    if (cntl->FailedInline()) {
         return cntl->HandleSendFailed();
     }
 
@@ -372,12 +542,12 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         // Setup timer for backup request. When it occurs, we'll setup a
         // timer of timeout_ms before sending backup request.
 
-        // _abstime_us is for truncating _connect_timeout_ms and resetting
+        // _deadline_us is for truncating _connect_timeout_ms and resetting
         // timer when EBACKUPREQUEST occurs.
         if (cntl->timeout_ms() < 0) {
-            cntl->_abstime_us = -1;
+            cntl->_deadline_us = -1;
         } else {
-            cntl->_abstime_us = cntl->timeout_ms() * 1000L + start_send_real_us;
+            cntl->_deadline_us = cntl->timeout_ms() * 1000L + start_send_real_us;
         }
         const int rc = bthread_timer_add(
             &cntl->_timeout_id,
@@ -391,18 +561,18 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     } else if (cntl->timeout_ms() >= 0) {
         // Setup timer for RPC timetout
 
-        // _abstime_us is for truncating _connect_timeout_ms
-        cntl->_abstime_us = cntl->timeout_ms() * 1000L + start_send_real_us;
+        // _deadline_us is for truncating _connect_timeout_ms
+        cntl->_deadline_us = cntl->timeout_ms() * 1000L + start_send_real_us;
         const int rc = bthread_timer_add(
             &cntl->_timeout_id,
-            butil::microseconds_to_timespec(cntl->_abstime_us),
+            butil::microseconds_to_timespec(cntl->_deadline_us),
             HandleTimeout, (void*)correlation_id.value);
         if (BAIDU_UNLIKELY(rc != 0)) {
             cntl->SetFailed(rc, "Fail to add timer for timeout");
             return cntl->HandleSendFailed();
         }
     } else {
-        cntl->_abstime_us = -1;
+        cntl->_deadline_us = -1;
     }
 
     cntl->IssueRPC(start_send_real_us);
@@ -435,13 +605,13 @@ int Channel::Weight() {
 int Channel::CheckHealth() {
     if (_lb == NULL) {
         SocketUniquePtr ptr;
-        if (Socket::Address(_server_id, &ptr) == 0) {
+        if (Socket::Address(_server_id, &ptr) == 0 && ptr->IsAvailable()) {
             return 0;
         }
         return -1;
     } else {
         SocketUniquePtr tmp_sock;
-        LoadBalancer::SelectIn sel_in = { 0, false, false, 0, NULL };
+        LoadBalancer::SelectIn sel_in = { 0, false, true, 0, NULL };
         LoadBalancer::SelectOut sel_out(&tmp_sock);
         return _lb->SelectServer(sel_in, &sel_out);
     }

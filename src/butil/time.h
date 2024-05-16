@@ -1,18 +1,20 @@
-// Copyright (c) 2010 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Wed Aug 11 10:38:17 2010
 
 // Measuring time
@@ -20,14 +22,21 @@
 #ifndef BUTIL_BAIDU_TIME_H
 #define BUTIL_BAIDU_TIME_H
 
-#ifdef __MACH__
-#include <mach/clock.h>
-#include <mach/mach.h>
-#endif
-
 #include <time.h>                            // timespec, clock_gettime
 #include <sys/time.h>                        // timeval, gettimeofday
 #include <stdint.h>                          // int64_t, uint64_t
+
+#if defined(NO_CLOCK_GETTIME_IN_MAC)
+#include <mach/mach.h>
+# define CLOCK_REALTIME CALENDAR_CLOCK
+# define CLOCK_MONOTONIC SYSTEM_CLOCK
+
+typedef int clockid_t;
+
+// clock_gettime is not available in MacOS < 10.12
+int clock_gettime(clockid_t id, timespec* time);
+
+#endif
 
 namespace butil {
 
@@ -92,17 +101,7 @@ inline timespec seconds_from(timespec start_time, int64_t seconds) {
 // --------------------------------------------------------------------
 inline timespec nanoseconds_from_now(int64_t nanoseconds) {
     timespec time;
-#ifdef __MACH__ // OS X does not have clock_gettime, use clock_get_time
-    clock_serv_t cclock;
-    mach_timespec_t mts;
-    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-    clock_get_time(cclock, &mts);
-    mach_port_deallocate(mach_task_self(), cclock);
-    time.tv_sec = mts.tv_sec;
-    time.tv_nsec = mts.tv_nsec;
-#else
     clock_gettime(CLOCK_REALTIME, &time);
-#endif
     return nanoseconds_from(time, nanoseconds);
 }
 
@@ -120,17 +119,7 @@ inline timespec seconds_from_now(int64_t seconds) {
 
 inline timespec timespec_from_now(const timespec& span) {
     timespec time;
-#ifdef __MACH__ // OS X does not have clock_gettime, use clock_get_time
-    clock_serv_t cclock;
-    mach_timespec_t mts;
-    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-    clock_get_time(cclock, &mts);
-    mach_port_deallocate(mach_task_self(), cclock);
-    time.tv_sec = mts.tv_sec;
-    time.tv_nsec = mts.tv_nsec;
-#else
     clock_gettime(CLOCK_REALTIME, &time);
-#endif
     timespec_add(&time, span);
     return time;
 }
@@ -226,6 +215,7 @@ inline int64_t monotonic_time_s() {
 
 namespace detail {
 inline uint64_t clock_cycles() {
+#if defined(__x86_64__) || defined(__amd64__)
     unsigned int lo = 0;
     unsigned int hi = 0;
     // We cannot use "=A", since this would use %rax on x86_64
@@ -234,6 +224,39 @@ inline uint64_t clock_cycles() {
         : "=a" (lo), "=d" (hi)
         );
     return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__)
+    uint64_t virtual_timer_value;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+    return virtual_timer_value;
+#elif defined(__ARM_ARCH)
+  #if (__ARM_ARCH >= 6)
+    unsigned int pmccntr;
+    unsigned int pmuseren;
+    unsigned int pmcntenset;
+    // Read the user mode perf monitor counter access permissions.
+    asm volatile ("mrc p15, 0, %0, c9, c14, 0" : "=r" (pmuseren));
+    if (pmuseren & 1) {  // Allows reading perfmon counters for user mode code.
+        asm volatile ("mrc p15, 0, %0, c9, c12, 1" : "=r" (pmcntenset));
+        if (pmcntenset & 0x80000000ul) {  // Is it counting?
+            asm volatile ("mrc p15, 0, %0, c9, c13, 0" : "=r" (pmccntr));
+            // The counter is set up to count every 64th cycle
+            return static_cast<uint64_t>(pmccntr) * 64;  // Should optimize to << 6
+        }
+    }
+  #else
+    #error "unsupported arm_arch"
+  #endif
+#elif defined(__loongarch64)
+    uint64_t stable_counter;
+    uint64_t counter_id;
+    __asm__ __volatile__ (
+        "rdtime.d %1, %0"
+        : "=r" (stable_counter), "=r" (counter_id)
+        );
+    return stable_counter;
+#else
+  #error "unsupported arch"
+#endif
 }
 extern int64_t read_invariant_cpu_frequency();
 // Be positive iff:
@@ -249,13 +272,26 @@ extern int64_t invariant_cpu_freq;
 // note: Inlining shortens time cost per-call for 15ns in a loop of many
 //       calls to this function.
 inline int64_t cpuwide_time_ns() {
-    if (detail::invariant_cpu_freq > 0) {
+#if !defined(BAIDU_INTERNAL)
+    // nearly impossible to get the correct invariant cpu frequency on
+    // different CPU and machines. CPU-ID rarely works and frequencies
+    // in "model name" and "cpu Mhz" are both unreliable.
+    // Since clock_gettime() in newer glibc/kernel is much faster(~30ns)
+    // which is closer to the previous impl. of cpuwide_time(~10ns), we
+    // simply use the monotonic time to get rid of all related issues.
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
+#else
+    int64_t cpu_freq = detail::invariant_cpu_freq;
+    if (cpu_freq > 0) {
         const uint64_t tsc = detail::clock_cycles();
-        const uint64_t sec = tsc / detail::invariant_cpu_freq;
+        //Try to avoid overflow
+        const uint64_t sec = tsc / cpu_freq;
+        const uint64_t remain = tsc % cpu_freq;
         // TODO: should be OK until CPU's frequency exceeds 16GHz.
-        return (tsc - sec * detail::invariant_cpu_freq) * 1000000000L /
-            detail::invariant_cpu_freq + sec * 1000000000L;
-    } else if (!detail::invariant_cpu_freq) {
+        return remain * 1000000000L / cpu_freq + sec * 1000000000L;
+    } else if (!cpu_freq) {
         // Lack of necessary features, return system-wide monotonic time instead.
         return monotonic_time_ns();
     } else {
@@ -264,6 +300,7 @@ inline int64_t cpuwide_time_ns() {
         detail::invariant_cpu_freq = detail::read_invariant_cpu_frequency();
         return cpuwide_time_ns();
     }
+#endif // defined(BAIDU_INTERNAL)
 }
 
 inline int64_t cpuwide_time_us() {

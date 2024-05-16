@@ -1,6 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
 // Date: Fri Jul 24 17:19:40 CST 2015
 
 #include <pthread.h>                                // pthread_*
@@ -50,12 +64,14 @@ protected:
 TEST_F(VariableTest, status) {
     bvar::Status<int> st1;
     st1.set_value(9);
+    ASSERT_TRUE(st1.is_hidden());
 #ifdef BAIDU_INTERNAL
     boost::any v1;
     st1.get_value(&v1);
     ASSERT_EQ(9, boost::any_cast<int>(v1));
 #endif
     ASSERT_EQ(0, st1.expose("var1"));
+    ASSERT_FALSE(st1.is_hidden());
     ASSERT_EQ("9", bvar::Variable::describe_exposed("var1"));
     std::vector<std::string> vars;
     bvar::Variable::list_exposed(&vars);
@@ -65,13 +81,16 @@ TEST_F(VariableTest, status) {
 
     bvar::Status<int> st2;
     st2.set_value(10);
+    ASSERT_TRUE(st2.is_hidden());
     ASSERT_EQ(-1, st2.expose("var1"));
+    ASSERT_TRUE(st2.is_hidden());
     ASSERT_EQ(1UL, bvar::Variable::count_exposed());
     ASSERT_EQ("10", st2.get_description());
     ASSERT_EQ("9", bvar::Variable::describe_exposed("var1"));
     ASSERT_EQ(1UL, bvar::Variable::count_exposed());
 
     ASSERT_TRUE(st1.hide());
+    ASSERT_TRUE(st1.is_hidden());
     ASSERT_EQ(0UL, bvar::Variable::count_exposed());
     ASSERT_EQ("", bvar::Variable::describe_exposed("var1"));
     ASSERT_EQ(0, st1.expose("var1"));

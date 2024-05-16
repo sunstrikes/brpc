@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <ostream>
 #include <iomanip>
@@ -192,7 +194,7 @@ static void PrintAnnotations(
         while (extractors[i]->PopAnnotation(cur_time, &anno_time, &a)) {
             PrintRealTime(os, anno_time);
             PrintElapse(os, anno_time, last_time);
-            os << ' ' << a;
+            os << ' ' << WebEscape(a);
             if (a.empty() || butil::back_char(a) != '\n') {
                 os << '\n';
             }
@@ -247,7 +249,7 @@ static void PrintClientSpan(
     if (abs_remote_side.ip == loopback_ip) {
         abs_remote_side.ip = butil::my_ip();
     }
-    os << " Requesting " << span.full_method_name() << '@' << remote_side
+    os << " Requesting " << WebEscape(span.full_method_name()) << '@' << remote_side
        << ' ' << protocol_name << ' ' << LOG_ID_STR << '=';
     if (FLAGS_rpcz_hex_log_id) {
         os << Hex(span.log_id());
@@ -307,6 +309,17 @@ static void PrintClientSpan(std::ostream& os,const RpczSpan& span,
     PrintClientSpan(os, span, &last_time, NULL, use_html);
 }
 
+static void PrintBthreadSpan(std::ostream& os, const RpczSpan& span, int64_t* last_time,
+                             SpanInfoExtractor* server_extr, bool use_html) {
+    SpanInfoExtractor client_extr(span.info().c_str());
+    int num_extr = 0;
+    SpanInfoExtractor* extr[2];
+    if (server_extr) {
+        extr[num_extr++] = server_extr;
+    }
+    extr[num_extr++] = &client_extr;
+    PrintAnnotations(os, std::numeric_limits<int64_t>::max(), last_time, extr, num_extr);
+}
 
 static void PrintServerSpan(std::ostream& os, const RpczSpan& span,
                             bool use_html) {
@@ -344,20 +357,24 @@ static void PrintServerSpan(std::ostream& os, const RpczSpan& span,
             os, span.start_callback_real_us(),
             &last_time, extr, ARRAY_SIZE(extr))) {
         entered_user_method = true;
-        os << " Enter " << span.full_method_name() << std::endl;
+        os << " Enter " << WebEscape(span.full_method_name()) << std::endl;
     }
 
     const int nclient = span.client_spans_size();
     for (int i = 0; i < nclient; ++i) {
-        PrintClientSpan(os, span.client_spans(i), &last_time,
-                        &server_extr, use_html);
+        auto& client_span = span.client_spans(i);
+        if (client_span.type() == SPAN_TYPE_CLIENT) {
+            PrintClientSpan(os, client_span, &last_time, &server_extr, use_html);
+        } else {
+            PrintBthreadSpan(os, client_span, &last_time, &server_extr, use_html);
+        }
     }
 
     if (PrintAnnotationsAndRealTimeSpan(
             os, span.start_send_real_us(),
             &last_time, extr, ARRAY_SIZE(extr))) {
         if (entered_user_method) {
-            os << " Leave " << span.full_method_name() << std::endl;
+            os << " Leave " << WebEscape(span.full_method_name()) << std::endl;
         } else {
             os << " Responding" << std::endl;
         }
@@ -663,7 +680,7 @@ void RpczService::default_method(::google::protobuf::RpcController* cntl_base,
             } else {
                 os << span.log_id();
             }
-            os << ' ' << span.full_method_name() << '(' << span.request_size()
+            os << ' ' << WebEscape(span.full_method_name()) << '(' << span.request_size()
                << ")=" << span.response_size();
             
             if (span.error_code() == 0) {

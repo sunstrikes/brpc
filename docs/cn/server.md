@@ -2,7 +2,7 @@
 
 # 示例程序
 
-Echo的[server端代码](https://github.com/brpc/brpc/blob/master/example/echo_c++/server.cpp)。
+Echo的[server端代码](https://github.com/apache/brpc/blob/master/example/echo_c++/server.cpp)。
 
 # 填写proto文件
 
@@ -33,30 +33,30 @@ protoc运行后会生成echo.pb.cc和echo.pb.h文件，你得include echo.pb.h�
 ```c++
 #include "echo.pb.h"
 ...
-class MyEchoService : public EchoService  {
+class MyEchoService : public EchoService {
 public:
-    void Echo(::google::protobuf::RpcController* cntl_base,
-              const ::example::EchoRequest* request,
-              ::example::EchoResponse* response,
-              ::google::protobuf::Closure* done) {
-        // 这个对象确保在return时自动调用done->Run()
-        brpc::ClosureGuard done_guard(done);
-         
-        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
- 
-        // 填写response
-        response->set_message(request->message());
-    }
+    void Echo(::google::protobuf::RpcController* cntl_base,
+              const ::example::EchoRequest* request,
+              ::example::EchoResponse* response,
+              ::google::protobuf::Closure* done) {
+        // 这个对象确保在return时自动调用done->Run()
+        brpc::ClosureGuard done_guard(done);
+         
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+ 
+        // 填写response
+        response->set_message(request->message());
+    }
 };
 ```
 
-Service在插入[brpc.Server](https://github.com/brpc/brpc/blob/master/src/brpc/server.h)后才可能提供服务。
+Service在插入[brpc.Server](https://github.com/apache/brpc/blob/master/src/brpc/server.h)后才可能提供服务。
 
 当客户端发来请求时，Echo()会被调用。参数的含义分别是：
 
 **controller**
 
-在brpc中可以静态转为brpc::Controller（前提是代码运行brpc.Server中），包含了所有request和response之外的参数集合，具体接口查阅[controller.h](https://github.com/brpc/brpc/blob/master/src/brpc/controller.h)
+在brpc中可以静态转为brpc::Controller（前提是代码运行brpc.Server中），包含了所有request和response之外的参数集合，具体接口查阅[controller.h](https://github.com/apache/brpc/blob/master/src/brpc/controller.h)
 
 **request**
 
@@ -87,26 +87,26 @@ brpc::ClosureGuard done_guard(done);
 一般来说，同步Service和异步Service分别按如下代码处理done：
 
 ```c++
-class MyFooService: public FooService  {
+class MyFooService: public FooService {
 public:
-    // 同步服务
-    void SyncFoo(::google::protobuf::RpcController* cntl_base,
-                 const ::example::EchoRequest* request,
-                 ::example::EchoResponse* response,
-                 ::google::protobuf::Closure* done) {
-         brpc::ClosureGuard done_guard(done);
-         ...
-    }
- 
-    // 异步服务
-    void AsyncFoo(::google::protobuf::RpcController* cntl_base,
-                  const ::example::EchoRequest* request,
-                  ::example::EchoResponse* response,
-                  ::google::protobuf::Closure* done) {
-         brpc::ClosureGuard done_guard(done);
-         ...
-         done_guard.release();
-    }
+    // 同步服务
+    void SyncFoo(::google::protobuf::RpcController* cntl_base,
+                 const ::example::EchoRequest* request,
+                 ::example::EchoResponse* response,
+                 ::google::protobuf::Closure* done) {
+         brpc::ClosureGuard done_guard(done);
+         ...
+    }
+ 
+    // 异步服务
+    void AsyncFoo(::google::protobuf::RpcController* cntl_base,
+                  const ::example::EchoRequest* request,
+                  ::example::EchoResponse* response,
+                  ::google::protobuf::Closure* done) {
+         brpc::ClosureGuard done_guard(done);
+         ...
+         done_guard.release();
+    }
 };
 ```
 
@@ -116,18 +116,18 @@ ClosureGuard的接口如下：
 // RAII: Call Run() of the closure on destruction.
 class ClosureGuard {
 public:
-    ClosureGuard();
-    // Constructed with a closure which will be Run() inside dtor.
-    explicit ClosureGuard(google::protobuf::Closure* done);
-    
-    // Call Run() of internal closure if it's not NULL.
-    ~ClosureGuard();
- 
-    // Call Run() of internal closure if it's not NULL and set it to `done'.
-    void reset(google::protobuf::Closure* done);
- 
-    // Set internal closure to NULL and return the one before set.
-    google::protobuf::Closure* release();
+    ClosureGuard();
+    // Constructed with a closure which will be Run() inside dtor.
+    explicit ClosureGuard(google::protobuf::Closure* done);
+    
+    // Call Run() of internal closure if it's not NULL.
+    ~ClosureGuard();
+ 
+    // Call Run() of internal closure if it's not NULL and set it to `done'.
+    void reset(google::protobuf::Closure* done);
+ 
+    // Set internal closure to NULL and return the one before set.
+    google::protobuf::Closure* release();
 };
 ```
 
@@ -135,7 +135,7 @@ public:
 
 调用Controller.SetFailed()可以把当前调用设置为失败，当发送过程出现错误时，框架也会调用这个函数。用户一般是在服务的CallMethod里调用这个函数，比如某个处理环节出错，SetFailed()后确认done->Run()被调用了就可以跳出函数了(若使用了ClosureGuard，跳出函数时会自动调用done，不用手动)。Server端的done的逻辑主要是发送response回client，当其发现用户调用了SetFailed()后，会把错误信息送回client。client收到后，它的Controller::Failed()会为true（成功时为false），Controller::ErrorCode()和Controller::ErrorText()则分别是错误码和错误信息。
 
-用户可以为http访问设置[status-code](http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html)，在server端一般是调用`controller.http_response().set_status_code()`，标准的status-code定义在[http_status_code.h](https://github.com/brpc/brpc/blob/master/src/brpc/http_status_code.h)中。Controller.SetFailed也会设置status-code，值是与错误码含义最接近的status-code，没有相关的则填500错误(brpc::HTTP_STATUS_INTERNAL_SERVER_ERROR)。如果你要覆盖status_code，设置代码一定要放在SetFailed()后，而不是之前。
+用户可以为http访问设置[status-code](http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html)，在server端一般是调用`controller.http_response().set_status_code()`，标准的status-code定义在[http_status_code.h](https://github.com/apache/brpc/blob/master/src/brpc/http_status_code.h)中。Controller.SetFailed也会设置status-code，值是与错误码含义最接近的status-code，没有相关的则填500错误(brpc::HTTP_STATUS_INTERNAL_SERVER_ERROR)。如果你要覆盖status_code，设置代码一定要放在SetFailed()后，而不是之前。
 
 ## 获取Client的地址
 
@@ -165,7 +165,7 @@ printf("local_side=%s\n", butil::endpoint2str(cntl->local_side()).c_str());
 
 有些server以等待后端服务返回结果为主，且处理时间特别长，为了及时地释放出线程资源，更好的办法是把done注册到被等待事件的回调中，等到事件发生后再调用done->Run()。
 
-异步service的最后一行一般是done_guard.release()以确保正常退出CallMethod时不会调用done->Run()。例子请看[example/session_data_and_thread_local](https://github.com/brpc/brpc/tree/master/example/session_data_and_thread_local/)。
+异步service的最后一行一般是done_guard.release()以确保正常退出CallMethod时不会调用done->Run()。例子请看[example/session_data_and_thread_local](https://github.com/apache/brpc/tree/master/example/session_data_and_thread_local/)。
 
 Service和Channel都可以使用done来表达后续的操作，但它们是**完全不同**的，请勿混淆：
 
@@ -192,8 +192,8 @@ int AddService(google::protobuf::Service* service, ServiceOwnership ownership);
 brpc::Server server;
 MyEchoService my_echo_service;
 if (server.AddService(&my_echo_service, brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
-    LOG(FATAL) << "Fail to add my_echo_service";
-    return -1;
+    LOG(FATAL) << "Fail to add my_echo_service";
+    return -1;
 }
 ```
 
@@ -201,21 +201,27 @@ Server启动后你无法再修改其中的Service。
 
 # 启动
 
-调用以下[Server](https://github.com/brpc/brpc/blob/master/src/brpc/server.h)的一下接口启动服务。
+调用以下[Server](https://github.com/apache/brpc/blob/master/src/brpc/server.h)的接口启动服务。
 
 ```c++
 int Start(const char* ip_and_port_str, const ServerOptions* opt);
 int Start(EndPoint ip_and_port, const ServerOptions* opt);
 int Start(int port, const ServerOptions* opt);
-int Start(const char *ip_str, PortRange port_range, const ServerOptions *opt);  // r32009后增加
+int Start(const char *ip_str, PortRange port_range, const ServerOptions *opt);  // r32009后增加
 ```
 
-"localhost:9000", "cq01-cos-dev00.cq01:8000", “127.0.0.1:7000"都是合法的`ip_and_port_str`。
+合法的`ip_and_port_str`：
+
+- 127.0.0.1:80    # IPV4
+- [::1]:8080      # IPV6
+- unix:path.sock  # Unix domain socket
+
+关于IPV6和Unix domain socket的使用，详见 [EndPoint](endpoint.md)。
 
 `options`为NULL时所有参数取默认值，如果你要使用非默认值，这么做就行了：
 
 ```c++
-brpc::ServerOptions options;  // 包含了默认值
+brpc::ServerOptions options;  // 包含了默认值
 options.xxx = yyy;
 ...
 server.Start(..., &options);
@@ -224,6 +230,10 @@ server.Start(..., &options);
 ## 监听多个端口
 
 一个server只能监听一个端口（不考虑ServerOptions.internal_port），需要监听N个端口就起N个Server。
+
+## 多进程监听一个端口
+
+启动时开启`reuse_port`这个flag，就可以多进程共同监听一个端口（底层是SO_REUSEPORT）。
 
 # 停止
 
@@ -243,15 +253,17 @@ RunUntilAskedToQuit()函数可以在大部分情况下简化server的运转和�
 ```c++
 // Wait until Ctrl-C is pressed, then Stop() and Join() the server.
 server.RunUntilAskedToQuit();
- 
+ 
 // server已经停止了，这里可以写释放资源的代码。
 ```
 
 Join()完成后可以修改其中的Service，并重新Start。
 
-# 被HTTP client访问
+# 被http/h2访问
 
-使用Protobuf的服务通常可以通过HTTP+json访问，存于http body的json串可与对应protobuf消息相互转化。以[echo server](https://github.com/brpc/brpc/blob/master/example/echo_c%2B%2B/server.cpp)为例，你可以用[curl](https://curl.haxx.se/)访问这个服务。
+使用Protobuf的服务通常可以通过http/h2+json访问，存于body的json串可与对应protobuf消息相互自动转化。
+
+以[echo server](https://github.com/apache/brpc/blob/master/example/echo_c%2B%2B/server.cpp)为例，你可以用[curl](https://curl.haxx.se/)访问这个服务。
 
 ```shell
 # -H 'Content-Type: application/json' is optional
@@ -259,7 +271,7 @@ $ curl -d '{"message":"hello"}' http://brpc.baidu.com:8765/EchoService/Echo
 {"message":"hello"}
 ```
 
-注意：也可以指定`Content-Type: application/proto`用http+protobuf二进制串访问服务，序列化性能更好。
+注意：也可以指定`Content-Type: application/proto`用http/h2+protobuf二进制串访问服务，序列化性能更好。
 
 ## json<=>pb
 
@@ -269,7 +281,7 @@ json字段通过匹配的名字和结构与pb字段一一对应。json中一定�
 
 ## 兼容早期版本client
 
-早期的brpc允许一个pb service被http协议访问时不设置pb请求，即使里面有required字段。一般来说这种service会自行解析http请求和设置http回复，并不会访问pb请求。但这也是非常危险的行为，毕竟这是pb service，但pb请求却是未定义的。
+早期的brpc允许一个pb service被http协议访问时不填充pb请求，即使里面有required字段。一般来说这种service会自行解析http请求和设置http回复，并不会访问pb请求。但这也是非常危险的行为，毕竟这是pb service，但pb请求却是未定义的。
 
 这种服务在升级到新版本rpc时会遇到障碍，因为brpc已不允许这种行为。为了帮助这种服务升级，brpc允许经过一些设置后不把http body自动转化为pb request(从而可自行处理），方法如下：
 
@@ -277,11 +289,11 @@ json字段通过匹配的名字和结构与pb字段一一对应。json中一定�
 brpc::ServiceOptions svc_opt;
 svc_opt.ownership = ...;
 svc_opt.restful_mappings = ...;
-svc_opt.allow_http_body_to_pb = false; //关闭http body至pb request的自动转化
+svc_opt.allow_http_body_to_pb = false; //关闭http/h2 body至pb request的自动转化
 server.AddService(service, svc_opt);
 ```
 
-如此设置后service收到http请求后不会尝试把body转化为pb请求，所以pb请求总是未定义状态，用户得在`cntl->request_protocol() == brpc::PROTOCOL_HTTP`认定请求是http时自行解析http body。
+如此设置后service收到http/h2请求后不会尝试把body转化为pb请求，所以pb请求总是未定义状态，用户得在`cntl->request_protocol() == brpc::PROTOCOL_HTTP || cntl->request_protocol() == brpc::PROTOCOL_H2`成立时自行解析body。
 
 相应地，当cntl->response_attachment()不为空且pb回复不为空时，框架不再报错，而是直接把cntl->response_attachment()作为回复的body。这个功能和设置allow_http_body_to_pb与否无关。如果放开自由度导致过多的用户犯错，可能会有进一步的调整。
 
@@ -293,7 +305,9 @@ server端会自动尝试其支持的协议，无需用户指定。`cntl->protoco
 
 - [流式RPC协议](streaming_rpc.md)，显示为"streaming_rpc", 默认启用。
 
-- http 1.0/1.1，显示为”http“，默认启用。
+- http/1.0和http/1.1协议，显示为”http“，默认启用。
+
+- http/2和gRPC协议，显示为"h2c"(未加密)或"h2"(加密)，默认启用。
 
 - RTMP协议，显示为"rtmp", 默认启用。
 
@@ -337,6 +351,17 @@ server端会自动尝试其支持的协议，无需用户指定。`cntl->protoco
 
 如果你有更多的协议需求，可以联系我们。
 
+# fork without exec
+一般来说，[fork](https://linux.die.net/man/3/fork)出的子进程应尽快调用[exec](https://linux.die.net/man/3/exec)以重置所有状态，中间只应调用满足async-signal-safe的函数。这么使用fork的brpc程序在之前的版本也不会有问题。
+
+但在一些场景中，用户想直接运行fork出的子进程，而不调用exec。由于fork只复制其调用者的线程，其余线程便随之消失了。对应到brpc中，bvar会依赖一个sampling_thread采样各种信息，在fork后便消失了，现象是很多bvar归零。
+
+最新版本的brpc会在fork后重建这个线程(如有必要)，从而使bvar在fork后能正常工作，再次fork也可以。已知问题是fork后cpu profiler不正常。然而，这并不意味着用户可随意地fork，不管是brpc还是上层应用都会大量地创建线程，它们在fork后不会被重建，因为：
+* 大部分fork会紧接exec，浪费了重建
+* 给代码编写带来很多的麻烦和复杂度
+
+brpc的策略是按需创建这类线程，同时fork without exec必须发生在所有可能创建这些线程的代码前。具体地说，至少**发生在初始化所有Server/Channel/应用代码前**，越早越好，不遵守这个约定的fork会导致程序不正常。另外，不支持fork without exec的lib相当普遍，最好避免这种用法。
+
 # 设置
 
 ## 版本
@@ -359,13 +384,13 @@ Server.set_version(...)可以为server设置一个名称+版本，可通过/vers
 
 ## 在每条日志后打印hostname
 
-此功能只对[butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h)中的日志宏有效。
+此功能只对[butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h)中的日志宏有效。
 
 打开[-log_hostname](http://brpc.baidu.com:8765/flags/log_hostname)后每条日志后都会带本机名称，如果所有的日志需要汇总到一起进行分析，这个功能可以帮助你了解某条日志来自哪台机器。
 
 ## 打印FATAL日志后退出程序
 
-此功能只对[butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h)中的日志宏有效，glog默认在FATAL日志时crash。
+此功能只对[butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h)中的日志宏有效，glog默认在FATAL日志时crash。
 
 打开[-crash_on_fatal_log](http://brpc.baidu.com:8765/flags/crash_on_fatal_log)后如果程序使用LOG(FATAL)打印了异常日志或违反了CHECK宏中的断言，那么程序会在打印日志后abort，这一般也会产生coredump文件，默认不打开。这个开关可在对程序的压力测试中打开，以确认程序没有进入过严重错误的分支。
 
@@ -373,7 +398,7 @@ Server.set_version(...)可以为server设置一个名称+版本，可通过/vers
 
 ## 最低日志级别
 
-此功能由[butil/logging.h](https://github.com/brpc/brpc/blob/master/src/butil/logging.h)和glog各自实现，为同名选项。
+此功能由[butil/logging.h](https://github.com/apache/brpc/blob/master/src/butil/logging.h)和glog各自实现，为同名选项。
 
 只有**不低于**-minloglevel指定的日志级别的日志才会被打印。这个选项可以动态修改。设置值和日志级别的对应关系：0=INFO 1=NOTICE 2=WARNING 3=ERROR 4=FATAL，默认为0。
 
@@ -455,7 +480,7 @@ baidu_std和hulu_pbrpc协议支持传递附件，这段数据由用户自定义�
 
 ## 开启SSL
 
-要开启SSL，首先确保代码依赖了最新的openssl库。如果openssl版本很旧，会有严重的安全漏洞，支持的加密算法也少，违背了开启SSL的初衷。然后设置`ServerOptions.ssl_options`，具体见[ssl_option.h](https://github.com/brpc/brpc/blob/master/src/brpc/ssl_option.h)。
+要开启SSL，首先确保代码依赖了最新的openssl库。如果openssl版本很旧，会有严重的安全漏洞，支持的加密算法也少，违背了开启SSL的初衷。然后设置`ServerOptions.ssl_options`，具体见[ssl_options.h](https://github.com/apache/brpc/blob/master/src/brpc/ssl_options.h)。
 
 ```c++
 // Certificate structure
@@ -494,8 +519,8 @@ struct ServerSSLOptions {
     // will be used.
     // Default: false
     bool strict_sni;
- 
-    // ... Other options
+ 
+    // ... Other options
 };
 ```
 
@@ -508,6 +533,13 @@ struct ServerSSLOptions {
   ```
 
 - 其余选项还包括：密钥套件选择（推荐密钥ECDHE-RSA-AES256-GCM-SHA384，chrome默认第一优先密钥，安全性很高，但比较耗性能）、session复用等。
+
+- 如果想支持应用层协议协商，可通过`alpns`选项设置Server端支持的协议字符串，在Server启动时会校验协议的有效性，多个协议间使用逗号分割。具体使用方式如下：
+
+  ```c++
+  ServerSSLOptions ssl_options;
+  ssl_options.alpns = "http, h2, baidu_std";
+  ```
 
 - SSL层在协议层之下（作用在Socket层），即开启后，所有协议（如HTTP）都支持用SSL加密后传输到Server，Server端会先进行SSL解密后，再把原始数据送到各个协议中去。
 
@@ -579,9 +611,9 @@ QPS是一个秒级的指标，无法很好地控制瞬间的流量爆发。而�
 
 ### 计算最大并发数
 
-最大并发度 = 极限QPS * 平均延时  ([little's law](https://en.wikipedia.org/wiki/Little%27s_law))
+最大并发度 = 极限QPS * 低负载延时  ([little's law](https://en.wikipedia.org/wiki/Little%27s_law))
 
-极限QPS和平均延时指的是server在没有严重积压请求的前提下（请求的延时仍能接受时）所能达到的最大QPS和当时的平均延时。一般的服务上线都会有性能压测，把测得的QPS和延时相乘一般就是该服务的最大并发度。
+极限QPS指的是server能达到的最大qps，低负载延时指的是server在没有严重积压请求的前提下时的平均延时。一般的服务上线都会有性能压测，把测得的QPS和延时相乘一般就是该服务的最大并发度。
 
 ### 限制server级别并发度
 
@@ -591,12 +623,15 @@ Server.ResetMaxConcurrency()可在server启动后动态修改server级别的max_
 
 ### 限制method级别并发度
 
-server.MaxConcurrencyOf("...") = ...可设置method级别的max_concurrency。可能的设置方法有：
+server.MaxConcurrencyOf("...") = ...可设置method级别的max_concurrency。也可以通过设置ServerOptions.method_max_concurrency一次性为所有的method设置最大并发。
+当ServerOptions.method_max_concurrency和server.MaxConcurrencyOf("...")=...同时被设置时，使用server.MaxConcurrencyOf()所设置的值。
 
 ```c++
-server.MaxConcurrencyOf("example.EchoService.Echo") = 10;
+ServerOptions.method_max_concurrency = 20;                   // Set the default maximum concurrency for all methods
+server.MaxConcurrencyOf("example.EchoService.Echo") = 10;    // Give priority to the value set by server.MaxConcurrencyOf()
 server.MaxConcurrencyOf("example.EchoService", "Echo") = 10;
 server.MaxConcurrencyOf(&service, "Echo") = 10;
+server.MaxConcurrencyOf("example.EchoService.Echo") = "10";  // You can also assign a string value
 ```
 
 此设置一般**发生在AddService后，server启动前**。当设置失败时（比如对应的method不存在），server会启动失败同时提示用户修正MaxConcurrencyOf设置错误。
@@ -604,6 +639,21 @@ server.MaxConcurrencyOf(&service, "Echo") = 10;
 当method级别和server级别的max_concurrency都被设置时，先检查server级别的，再检查method级别的。
 
 注意：没有service级别的max_concurrency。
+
+### 使用自适应限流算法
+实际生产环境中,最大并发未必一成不变，在每次上线前逐个压测和设置服务的最大并发也很繁琐。这个时候可以使用自适应限流算法。
+
+自适应限流是method级别的。要使用自适应限流算法，把method的最大并发度设置为"auto"即可:
+
+```c++
+// Set auto concurrency limiter for all methods
+brpc::ServerOptions options;
+options.method_max_concurrency = "auto";
+
+// Set auto concurrency limiter for specific method
+server.MaxConcurrencyOf("example.EchoService.Echo") = "auto";
+```
+关于自适应限流的更多细节可以看[这里](auto_concurrency_limiter.md)
 
 ## pthread模式
 
@@ -613,6 +663,8 @@ server.MaxConcurrencyOf(&service, "Echo") = 10;
 - 代码中广泛地使用pthread local传递session级别全局数据，在RPC前后均使用了相同的pthread local的数据，且数据有前后依赖性。比如在RPC前往pthread-local保存了一个值，RPC后又读出来希望和之前保存的相等，就会有问题。而像tcmalloc虽然也使用了pthread/LWP local，但每次使用之间没有直接的依赖，是安全的。
 
 对于这些情况，brpc提供了pthread模式，开启**-usercode_in_pthread**后，用户代码均会在pthread中运行，原先阻塞bthread的函数转而阻塞pthread。
+
+注意：开启-usercode_in_pthread后，brpc::thread_local_data()不保证能获取到值。
 
 打开pthread模式后在性能上的注意点：
 
@@ -650,6 +702,10 @@ pthread模式可以让一些老代码快速尝试brpc，但我们仍然建议逐
 ```shell
 curl -s -m 1 <HOSTNAME>:<PORT>/flags/enable_dir_service,enable_threads_service | awk '{if($3=="false"){++falsecnt}else if($3=="Value"){isrpc=1}}END{if(isrpc!=1||falsecnt==2){print "SAFE"}else{print "NOT SAFE"}}'
 ```
+### 完全禁用内置服务
+
+设置ServerOptions.has_builtin_services = false，可以完全禁用内置服务。
+
 ### 转义外部可控的URL
 
 可调用brpc::WebEscape()对url进行转义，防止恶意URI注入攻击。
@@ -660,7 +716,7 @@ curl -s -m 1 <HOSTNAME>:<PORT>/flags/enable_dir_service,enable_threads_service |
 
 ## 定制/health页面
 
-/health页面默认返回"OK"，若需定制/health页面的内容：先继承[HealthReporter](https://github.com/brpc/brpc/blob/master/src/brpc/health_reporter.h)，在其中实现生成页面的逻辑（就像实现其他http service那样），然后把实例赋给ServerOptions.health_reporter，这个实例不被server拥有，必须保证在server运行期间有效。用户在定制逻辑中可以根据业务的运行状态返回更多样的状态信息。
+/health页面默认返回"OK"，若需定制/health页面的内容：先继承[HealthReporter](https://github.com/apache/brpc/blob/master/src/brpc/health_reporter.h)，在其中实现生成页面的逻辑（就像实现其他http service那样），然后把实例赋给ServerOptions.health_reporter，这个实例不被server拥有，必须保证在server运行期间有效。用户在定制逻辑中可以根据业务的运行状态返回更多样的状态信息。
 
 ## 线程私有变量
 
@@ -721,7 +777,7 @@ struct ServerOptions {
 };
 ```
 
-session_local_data_factory的类型为[DataFactory](https://github.com/brpc/brpc/blob/master/src/brpc/data_factory.h)，你需要实现其中的CreateData和DestroyData。
+session_local_data_factory的类型为[DataFactory](https://github.com/apache/brpc/blob/master/src/brpc/data_factory.h)，你需要实现其中的CreateData和DestroyData。
 
 注意：CreateData和DestroyData会被多个线程同时调用，必须线程安全。
 
@@ -735,15 +791,16 @@ public:
         delete static_cast<MySessionLocalData*>(d);
     }  
 };
- 
+
+MySessionLocalDataFactory g_session_local_data_factory;
+
 int main(int argc, char* argv[]) {
     ...
-    MySessionLocalDataFactory session_local_data_factory;
  
     brpc::Server server;
     brpc::ServerOptions options;
     ...
-    options.session_local_data_factory = &session_local_data_factory;
+    options.session_local_data_factory = &g_session_local_data_factory;
     ...
 ```
 
@@ -751,7 +808,7 @@ int main(int argc, char* argv[]) {
 
 server-thread-local与一次service回调绑定，从进service回调开始，到出service回调结束。所有的server-thread-local data会被尽量重用，在server停止前不会被删除。在实现上server-thread-local是一个特殊的bthread-local。
 
-设置ServerOptions.thread_local_data_factory后访问Controller.thread_local_data()即可获得thread-local数据。若没有设置，Controller.thread_local_data()总是返回NULL。
+设置ServerOptions.thread_local_data_factory后访问brpc::thread_local_data()即可获得thread-local数据。若没有设置，brpc::thread_local_data()总是返回NULL。
 
 若ServerOptions.reserved_thread_local_data大于0，Server会在启动前就创建这么多个数据。
 
@@ -811,7 +868,7 @@ struct ServerOptions {
 };
 ```
 
-thread_local_data_factory的类型为[DataFactory](https://github.com/brpc/brpc/blob/master/src/brpc/data_factory.h)，你需要实现其中的CreateData和DestroyData。
+thread_local_data_factory的类型为[DataFactory](https://github.com/apache/brpc/blob/master/src/brpc/data_factory.h)，你需要实现其中的CreateData和DestroyData。
 
 注意：CreateData和DestroyData会被多个线程同时调用，必须线程安全。
 
@@ -826,14 +883,15 @@ public:
     }  
 };
  
+MyThreadLocalDataFactory g_thread_local_data_factory;
+
 int main(int argc, char* argv[]) {
     ...
-    MyThreadLocalDataFactory thread_local_data_factory;
  
     brpc::Server server;
     brpc::ServerOptions options;
     ...
-    options.thread_local_data_factory  = &thread_local_data_factory;
+    options.thread_local_data_factory  = &g_thread_local_data_factory;
     ...
 ```
 
@@ -855,7 +913,7 @@ Session-local和server-thread-local对大部分server已经够用。不过在一
 // associated is NULL when the key is destroyed.
 // Returns 0 on success, error code otherwise.
 extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void* data));
- 
+ 
 // Delete a key previously returned by bthread_key_create().
 // It is the responsibility of the application to free the data related to
 // the deleted key in any running thread. No destructor is invoked by
@@ -863,7 +921,7 @@ extern int bthread_key_create(bthread_key_t* key, void (*destructor)(void* data)
 // will no longer be called upon thread exit.
 // Returns 0 on success, error code otherwise.
 extern int bthread_key_delete(bthread_key_t key);
- 
+ 
 // Store `data' in the thread-specific slot identified by `key'.
 // bthread_setspecific() is callable from within destructor. If the application
 // does so, destructors will be repeatedly called for at most
@@ -878,7 +936,7 @@ extern int bthread_key_delete(bthread_key_t key);
 // Returns 0 on success, error code otherwise.
 // If the key is invalid or deleted, return EINVAL.
 extern int bthread_setspecific(bthread_key_t key, void* data);
- 
+ 
 // Return current value of the thread-specific slot identified by `key'.
 // If bthread_setspecific() had not been called in the thread, return NULL.
 // If the key is invalid or deleted, return NULL.

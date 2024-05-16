@@ -1,36 +1,38 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A server to receive EchoRequest and send back EchoResponse.
 
 #include <gflags/gflags.h>
 #include <butil/logging.h>
 #include <brpc/server.h>
+#include <json2pb/pb_to_json.h>
 #include "echo.pb.h"
 
 DEFINE_bool(send_attachment, true, "Carry attachment along with response");
 DEFINE_int32(port, 8003, "TCP Port of this server");
 DEFINE_int32(idle_timeout_s, -1, "Connection will be closed if there is no "
              "read/write operations during the last `idle_timeout_s'");
-DEFINE_int32(logoff_ms, 2000, "Maximum duration of server's LOGOFF state "
-             "(waiting for client to close connection before server stops)");
 
 // Your implementation of example::EchoService
 class EchoServiceImpl : public example::EchoService {
 public:
-    EchoServiceImpl() {};
-    virtual ~EchoServiceImpl() {};
+    EchoServiceImpl() {}
+    virtual ~EchoServiceImpl() {}
     virtual void Echo(google::protobuf::RpcController* cntl_base,
                       const example::EchoRequest* request,
                       example::EchoResponse* response,
@@ -38,9 +40,14 @@ public:
         // This object helps you to call done->Run() in RAII style. If you need
         // to process the request asynchronously, pass done_guard.release().
         brpc::ClosureGuard done_guard(done);
-        
+
         brpc::Controller* cntl =
             static_cast<brpc::Controller*>(cntl_base);
+
+        // optional: set a callback function which is called after response is sent
+        // and before cntl/req/res is destructed.
+        cntl->set_after_rpc_resp_fn(std::bind(&EchoServiceImpl::CallAfterRpc,
+            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
 
         // The purpose of following logs is to help you to understand
         // how clients interact with servers more intuitively. You should 
@@ -62,6 +69,19 @@ public:
             // being serialized into protobuf messages.
             cntl->response_attachment().append("bar");
         }
+    }
+
+    // optional
+    static void CallAfterRpc(brpc::Controller* cntl,
+                        const google::protobuf::Message* req,
+                        const google::protobuf::Message* res) {
+        // at this time res is already sent to client, but cntl/req/res is not destructed
+        std::string req_str;
+        std::string res_str;
+        json2pb::ProtoMessageToJson(*req, &req_str, NULL);
+        json2pb::ProtoMessageToJson(*res, &res_str, NULL);
+        LOG(INFO) << "req:" << req_str
+                    << " res:" << res_str;
     }
 };
 

@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen(chenzhangyi01@baidu.com)
-//          Ge,Jun (gejun@baidu.com)
 
 #ifndef  BRPC_HTTP_HEADER_H
 #define  BRPC_HTTP_HEADER_H
@@ -23,6 +24,7 @@
 #include "brpc/uri.h"              // URI
 #include "brpc/http_method.h"      // HttpMethod
 #include "brpc/http_status_code.h"
+#include "brpc/http2.h"
 
 // To rpc developers: DON'T put impl. details here, use opaque pointers instead.
 
@@ -31,6 +33,7 @@ namespace brpc {
 class InputMessageBase;
 namespace policy {
 void ProcessHttpRequest(InputMessageBase *msg);
+class H2StreamContext;
 }
 
 // Non-body part of a HTTP message.
@@ -38,6 +41,7 @@ class HttpHeader {
 public:
     typedef butil::CaseIgnoredFlatMap<std::string> HeaderMap;
     typedef HeaderMap::const_iterator HeaderIterator;
+    typedef HeaderMap::key_equal HeaderKeyEqual;
 
     HttpHeader();
 
@@ -61,32 +65,35 @@ public:
     // True if the message is from HTTP2.
     bool is_http2() const { return major_version() == 2; }
 
-    // Get/set "Content-Type". Notice that you can't get "Content-Type"
-    // via GetHeader().
+    // Get/set "Content-Type".
     // possible values: "text/plain", "application/json" ...
+    // NOTE: Equal to `GetHeader("Content-Type")', ·SetHeader("Content-Type")‘ (case-insensitive).
     const std::string& content_type() const { return _content_type; }
     void set_content_type(const std::string& type) { _content_type = type; }
     void set_content_type(const char* type) { _content_type = type; }
+    std::string& mutable_content_type() { return _content_type; }
     
     // Get value of a header which is case-insensitive according to:
     //   https://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2
     // Namely, GetHeader("log-id"), GetHeader("Log-Id"), GetHeader("LOG-ID")
     // point to the same value.
     // Return pointer to the value, NULL on not found.
-    // NOTE: Not work for "Content-Type", call content_type() instead.
+    // NOTE: If the key is "Content-Type", `GetHeader("Content-Type")'
+    // (case-insensitive) is equal to `content_type()'.
     const std::string* GetHeader(const char* key) const
     { return _headers.seek(key); }
     const std::string* GetHeader(const std::string& key) const
     { return _headers.seek(key); }
 
     // Set value of a header.
-    // NOTE: Not work for "Content-Type", call set_content_type() instead.
+    // NOTE: If the key is "Content-Type", `SetHeader("Content-Type", ...)'
+    // (case-insensitive) is equal to `set_content_type(...)'.
     void SetHeader(const std::string& key, const std::string& value)
     { GetOrAddHeader(key) = value; }
 
     // Remove a header.
-    void RemoveHeader(const char* key) { _headers.erase(key); }
-    void RemoveHeader(const std::string& key) { _headers.erase(key); }
+    void RemoveHeader(const char* key);
+    void RemoveHeader(const std::string& key) { RemoveHeader(key.c_str()); }
 
     // Append value to a header. If the header already exists, separate
     // old value and new value with comma(,) according to:
@@ -135,13 +142,13 @@ public:
 private:
 friend class HttpMessage;
 friend class HttpMessageSerializer;
+friend class policy::H2StreamContext;
 friend void policy::ProcessHttpRequest(InputMessageBase *msg);
 
-    std::string& GetOrAddHeader(const std::string& key) {
-        if (!_headers.initialized()) {
-            _headers.init(29);
-        }
-        return _headers[key];
+    std::string& GetOrAddHeader(const std::string& key);
+
+    static bool IsContentType(const std::string& key) {
+        return HeaderKeyEqual()(key, "content-type");
     }
 
     HeaderMap _headers;

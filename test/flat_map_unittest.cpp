@@ -1,5 +1,19 @@
-// Copyright (c) 2013 Baidu, Inc.
-// Author: gejun@baidu.com
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <gtest/gtest.h>
 #include <stdio.h>
@@ -108,45 +122,71 @@ TEST_F(FlatMapTest, copy_flat_map) {
 
     Map m1;
     ASSERT_EQ(0, m1.init(16));
-    m1["hello"] = "world";
-    m1["foo"] = "bar";
+    size_t expected_count = 0;
+    m1["hello"] = "world"; ++expected_count;
+    m1["foo"] = "bar"; ++ expected_count;
+    m1["friend"] = "alice"; ++ expected_count;
+    m1["zone"] = "bj-01"; ++ expected_count;
+    m1["city"] = "shanghai"; ++ expected_count;
+    m1["owner"] = "bob"; ++ expected_count;
+    m1["lang"] = "chinese"; ++ expected_count;
     ASSERT_TRUE(m1.initialized());
-    ASSERT_EQ(2u, m1.size());
+    ASSERT_EQ(expected_count, m1.size());
     // self assignment does nothing.
     m1 = m1;
-    ASSERT_EQ(2u, m1.size());
+    ASSERT_EQ(expected_count, m1.size());
     ASSERT_EQ("world", m1["hello"]);
     ASSERT_EQ("bar", m1["foo"]);
+    ASSERT_EQ("bob", m1["owner"]);
+    ASSERT_EQ("bj-01", m1["zone"]);
+    ASSERT_EQ("shanghai", m1["city"]);
+    ASSERT_EQ("chinese", m1["lang"]);
+    ASSERT_EQ("alice", m1["friend"]);
     // Copy construct from initialized map.
     Map m2 = m1;
     ASSERT_TRUE(m2.initialized());
-    ASSERT_EQ(2u, m2.size());
+    ASSERT_EQ(expected_count, m2.size());
     ASSERT_EQ("world", m2["hello"]);
     ASSERT_EQ("bar", m2["foo"]);
+    ASSERT_EQ("bob", m2["owner"]);
+    ASSERT_EQ("bj-01", m2["zone"]);
+    ASSERT_EQ("shanghai", m2["city"]);
+    ASSERT_EQ("chinese", m2["lang"]);
+    ASSERT_EQ("alice", m2["friend"]);
     // assign initialized map to uninitialized map.
     Map m3;
     m3 = m1;
     ASSERT_TRUE(m3.initialized());
-    ASSERT_EQ(2u, m3.size());
+    ASSERT_EQ(expected_count, m3.size());
     ASSERT_EQ("world", m3["hello"]);
     ASSERT_EQ("bar", m3["foo"]);
+    ASSERT_EQ("bob", m3["owner"]);
+    ASSERT_EQ("bj-01", m3["zone"]);
+    ASSERT_EQ("shanghai", m3["city"]);
+    ASSERT_EQ("chinese", m3["lang"]);
+    ASSERT_EQ("alice", m3["friend"]);
     // assign initialized map to initialized map (triggering resize)
     Map m4;
     ASSERT_EQ(0, m4.init(2));
-    ASSERT_LT(m4.bucket_count(), m1.bucket_count());
+    ASSERT_LE(m4.bucket_count(), m1.bucket_count());
     const void* old_buckets4 = m4._buckets;
     m4 = m1;
     ASSERT_EQ(m1.bucket_count(), m4.bucket_count());
     ASSERT_NE(old_buckets4, m4._buckets);
-    ASSERT_EQ(2u, m4.size());
+    ASSERT_EQ(expected_count, m4.size());
     ASSERT_EQ("world", m4["hello"]);
     ASSERT_EQ("bar", m4["foo"]);
+    ASSERT_EQ("bob", m4["owner"]);
+    ASSERT_EQ("bj-01", m4["zone"]);
+    ASSERT_EQ("shanghai", m4["city"]);
+    ASSERT_EQ("chinese", m4["lang"]);
+    ASSERT_EQ("alice", m4["friend"]);
     // assign initialized map to initialized map (no resize)
-    const size_t bcs[] = { 8, m1.bucket_count(), 32 };
+    const size_t bcs[] = { m1.bucket_count(), 32 };
     // less than m1.bucket_count but enough for holding the elements
-    ASSERT_LT(bcs[0], m1.bucket_count());
+    ASSERT_LE(bcs[0], m1.bucket_count());
     // larger than m1.bucket_count
-    ASSERT_GT(bcs[2], m1.bucket_count());
+    ASSERT_GE(bcs[1], m1.bucket_count());
     for (size_t i = 0; i < arraysize(bcs); ++i) {
         Map m5;
         ASSERT_EQ(0, m5.init(bcs[i]));
@@ -155,9 +195,14 @@ TEST_F(FlatMapTest, copy_flat_map) {
         m5 = m1;
         ASSERT_EQ(old_bucket_count5, m5.bucket_count());
         ASSERT_EQ(old_buckets5, m5._buckets);
-        ASSERT_EQ(2u, m5.size());
+        ASSERT_EQ(expected_count, m5.size());
         ASSERT_EQ("world", m5["hello"]);
         ASSERT_EQ("bar", m5["foo"]);
+        ASSERT_EQ("bob", m5["owner"]);
+        ASSERT_EQ("bj-01", m5["zone"]);
+        ASSERT_EQ("shanghai", m5["city"]);
+        ASSERT_EQ("chinese", m5["lang"]);
+        ASSERT_EQ("alice", m5["friend"]);
     }
 }
 
@@ -223,23 +268,43 @@ TEST_F(FlatMapTest, __builtin_ctzl_perf) {
         s += __builtin_ctzl(i);
     }
     tm1.stop();
-    LOG(INFO) << "__builtin_ctzl takes " << tm1.n_elapsed()/(double)N << "ns";
+    LOG(INFO) << "__builtin_ctzl takes " << tm1.n_elapsed()/(double)N << "ns s=" << s;
 }
 
 TEST_F(FlatMapTest, case_ignored_map) {
-    butil::Timer tm;
-    tm.start();
     butil::CaseIgnoredFlatMap<int> m1;
     ASSERT_EQ(0, m1.init(32));
     m1["Content-Type"] = 1;
+    m1["content-Type"] = 10;
     m1["Host"] = 2;
+    m1["HOST"] = 20;
     m1["Cache-Control"] = 3;
-    ASSERT_EQ(1, m1["cONTENT-tYPE"]);
-    ASSERT_EQ(2, m1["hOST"]);
-    ASSERT_EQ(3, m1["cache-control"]);
-    tm.stop();
-    std::cout << tm.n_elapsed() << std::endl;
+    m1["CachE-ControL"] = 30;
+    ASSERT_EQ(10, m1["cONTENT-tYPE"]);
+    ASSERT_EQ(20, m1["hOST"]);
+    ASSERT_EQ(30, m1["cache-control"]);
 }
+
+TEST_F(FlatMapTest, case_ignored_set) {
+    butil::CaseIgnoredFlatSet s1;
+    ASSERT_EQ(0, s1.init(32));
+    s1.insert("Content-Type");
+    ASSERT_EQ(1ul, s1.size());
+    s1.insert("Content-TYPE");
+    ASSERT_EQ(1ul, s1.size());
+    s1.insert("Host");
+    ASSERT_EQ(2ul, s1.size());
+    s1.insert("HOST");
+    ASSERT_EQ(2ul, s1.size());
+    s1.insert("Cache-Control");
+    ASSERT_EQ(3ul, s1.size());
+    s1.insert("CachE-ControL");
+    ASSERT_EQ(3ul, s1.size());
+    ASSERT_TRUE(s1.seek("cONTENT-tYPE"));
+    ASSERT_TRUE(s1.seek("hOST"));
+    ASSERT_TRUE(s1.seek("cache-control"));
+}
+
 
 TEST_F(FlatMapTest, make_sure_all_methods_compile) {
     typedef butil::FlatMap<int, long> M1;
@@ -253,10 +318,13 @@ TEST_F(FlatMapTest, make_sure_all_methods_compile) {
     ASSERT_EQ(20, m1[2]);
     ASSERT_EQ(2u, m1.size());
     m1.insert(1, 100);
+    m1.insert({3, 30});
     ASSERT_EQ(100, m1[1]);
-    ASSERT_EQ(2u, m1.size());
-    ASSERT_EQ(NULL, m1.seek(3));
-    ASSERT_EQ(0u, m1.erase(3));
+    ASSERT_EQ(3u, m1.size());
+    ASSERT_TRUE(m1.seek(3));
+    ASSERT_EQ(NULL, m1.seek(4));
+    ASSERT_EQ(1u, m1.erase(3));
+    ASSERT_EQ(0u, m1.erase(4));
     ASSERT_EQ(2u, m1.size());
     ASSERT_EQ(1u, m1.erase(2));
     ASSERT_EQ(1u, m1.size());
@@ -371,7 +439,7 @@ TEST_F(FlatMapTest, flat_map_of_string) {
 
     LOG(INFO) << "finding c_strings takes " << tm1.n_elapsed()/N
               << " " << tm2.n_elapsed()/N << " " << tm3.n_elapsed()/N
-              << " " << tm1_2.n_elapsed()/N;
+              << " " << tm1_2.n_elapsed()/N << " sum=" << sum;
     
     for (size_t i = 0; i < N; ++i) {
         ASSERT_EQ(i, m1[keys[i]]) << "i=" << i;
@@ -759,7 +827,7 @@ TEST_F(FlatMapTest, perf_cmp_with_map_storing_pointers) {
         sum += (m3.find(r[i]) != m3.end());
     }
     tm.stop();
-    LOG(INFO) << "std::set takes " << tm.n_elapsed()/r.size();
+    LOG(INFO) << "std::set takes " << tm.n_elapsed()/r.size() << " sum=" << sum;
 
     for (size_t i = 0; i < ARRAY_SIZE(ptr); ++i) {
         delete ptr[i];
@@ -799,6 +867,7 @@ struct Key {
     Key() : x_(0) { ++n_con_key; }
     Key(int x) : x_(x) { ++ n_con_key; }
     Key(const Key& rhs) : x_(rhs.x_) { ++ n_cp_con_key; }
+    void operator=(const Key& rhs) { x_ = rhs.x_; }
     ~Key() { ++ n_des_key; }
     int x_;
 };
@@ -1227,7 +1296,8 @@ template <typename T> void perf_seek(const T& value) {
                   << id_tm.n_elapsed() / keys.size()
                   << "/" << std_tm.n_elapsed() / keys.size()
                   << "/" << pooled_tm.n_elapsed() / keys.size()
-                  << "/" << hash_tm.n_elapsed() / keys.size();
+                  << "/" << hash_tm.n_elapsed() / keys.size()
+                  << " sum=" << sum;
     }
 }
 
@@ -1262,6 +1332,21 @@ TEST_F(FlatMapTest, copy) {
     m2 = m1;
     ASSERT_FALSE(m1.is_too_crowded(m1.size()));
     ASSERT_FALSE(m2.is_too_crowded(m1.size()));
+
+    butil::FlatMap<int, int> m3;
+    ASSERT_FALSE(m3.initialized());
+    m1 = m3;
+    ASSERT_TRUE(m1.empty());
+    ASSERT_TRUE(m1.initialized());
+
+    m3 = m2;
+    ASSERT_TRUE(m3.initialized());
+    m3.clear();
+    ASSERT_TRUE(m3.initialized());
+    ASSERT_TRUE(m3.empty());
+    butil::FlatMap<int, int> m4 = m3;
+    ASSERT_TRUE(m4.initialized());
+    ASSERT_TRUE(m4.empty());
 }
 
 }

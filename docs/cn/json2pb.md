@@ -1,4 +1,4 @@
-brpc支持json和protobuf间的**双向**转化，实现于[json2pb](https://github.com/brpc/brpc/tree/master/src/json2pb/)，json解析使用[rapidjson](https://github.com/miloyip/rapidjson)。此功能对pb2.x和3.x均有效。pb3内置了[转换json](https://developers.google.com/protocol-buffers/docs/proto3#json)的功能。
+brpc支持json和protobuf间的**双向**转化，实现于[json2pb](https://github.com/apache/brpc/tree/master/src/json2pb/)，json解析使用[rapidjson](https://github.com/miloyip/rapidjson)。此功能对pb2.x和3.x均有效。pb3内置了[转换json](https://developers.google.com/protocol-buffers/docs/proto3#json)的功能。
 
 by design, 通过HTTP + json访问protobuf服务是对外服务的常见方式，故转化必须精准，转化规则列举如下。
 
@@ -32,6 +32,24 @@ repeated int32 numbers = 1;
 
 // rapidjson
 {"numbers" : [12, 17, 1, 24] }
+```
+
+特别的，针对仅有一个 `repeated` 类型成员的 `message`，序列化为 `json` 时支持直接序列化为数组，以简化包体。
+
+```protobuf
+// protobuf
+message Foo {
+    repeated int32 numbers = 1;
+}
+
+// rapidjson
+[12, 17, 1, 24]
+```
+
+该特性默认为关闭状态，客户端在发送请求时，或服务端在发送回复时，可手动开启：
+```c++
+brpc::Controller cntl;
+cntl.set_pb_single_repeated_to_array(true);
 ```
 
 ## map

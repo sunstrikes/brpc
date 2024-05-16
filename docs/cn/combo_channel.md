@@ -1,6 +1,6 @@
 [English version](../en/combo_channel.md)
 
-随着服务规模的增大，对下游的访问流程会越来越复杂，其中往往包含多个同时发起的RPC或有复杂的层次结构。但这类代码的多线程陷阱很多，用户可能写出了bug也不自知，复现和调试也比较困难。而且实现要么只能支持同步的情况，要么要么得为异步重写一套。以"在多个异步RPC完成后运行一些代码"为例，它的同步实现一般是异步地发起多个RPC，然后逐个等待各自完成；它的异步实现一般是用一个带计数器的回调，每当一个RPC完成时计数器减一，直到0时调用回调。可以看到它的缺点：
+随着服务规模的增大，对下游的访问流程会越来越复杂，其中往往包含多个同时发起的RPC或有复杂的层次结构。但这类代码的多线程陷阱很多，用户可能写出了bug也不自知，复现和调试也比较困难。而且实现要么只能支持同步的情况，要么得为异步重写一套。以"在多个异步RPC完成后运行一些代码"为例，它的同步实现一般是异步地发起多个RPC，然后逐个等待各自完成；它的异步实现一般是用一个带计数器的回调，每当一个RPC完成时计数器减一，直到0时调用回调。可以看到它的缺点：
 
 - 同步和异步代码不一致。用户无法轻易地从一个模式转为另一种模式。从设计的角度，不一致暗示了没有抓住本质。
 - 往往不能被取消。正确及时地取消一个操作不是一件易事，何况是组合访问。但取消对于终结无意义的等待是很必要的。
@@ -17,7 +17,7 @@ ParallelChannel (有时被称为“pchan”)同时访问其包含的sub channel�
 - 可以取消。
 - 支持超时。
 
-示例代码见[example/parallel_echo_c++](https://github.com/brpc/brpc/tree/master/example/parallel_echo_c++/)。
+示例代码见[example/parallel_echo_c++](https://github.com/apache/brpc/tree/master/example/parallel_echo_c++/)。
 
 任何brpc::ChannelBase的子类都可以加入ParallelChannel，包括ParallelChannel和其他组合Channel。用户可以设置ParallelChannelOptions.fail_limit来控制访问的最大失败次数，当失败的访问达到这个数目时，RPC会立刻结束而不等待超时。
 
@@ -52,6 +52,7 @@ public:
     virtual ~CallMapper();
  
     virtual SubCall Map(int channel_index/*starting from 0*/,
+                        int channel_count,
                         const google::protobuf::MethodDescriptor* method,
                         const google::protobuf::Message* request,
                         google::protobuf::Message* response) = 0;
@@ -59,6 +60,8 @@ public:
 ```
 
 channel_index：该sub channel在ParallelChannel中的位置，从0开始计数。
+
+channel_count：ParallelChannel中sub channel的数量。
 
 method/request/response：ParallelChannel.CallMethod()的参数。
 
@@ -152,14 +155,14 @@ const Controller* sub(int index) const;
 
 # SelectiveChannel
 
-[SelectiveChannel](https://github.com/brpc/brpc/blob/master/src/brpc/selective_channel.h) (有时被称为“schan”)按负载均衡算法访问其包含的Channel，相比普通Channel它更加高层：把流量分给sub channel，而不是具体的Server。SelectiveChannel主要用来支持机器组之间的负载均衡，它具备Channel的主要属性：
+[SelectiveChannel](https://github.com/apache/brpc/blob/master/src/brpc/selective_channel.h) (有时被称为“schan”)按负载均衡算法访问其包含的Channel，相比普通Channel它更加高层：把流量分给sub channel，而不是具体的Server。SelectiveChannel主要用来支持机器组之间的负载均衡，它具备Channel的主要属性：
 
 - 支持同步和异步访问。
 - 发起异步操作后可以立刻删除。
 - 可以取消。
 - 支持超时。
 
-示例代码见[example/selective_echo_c++](https://github.com/brpc/brpc/tree/master/example/selective_echo_c++/)。
+示例代码见[example/selective_echo_c++](https://github.com/apache/brpc/tree/master/example/selective_echo_c++/)。
 
 任何brpc::ChannelBase的子类都可加入SelectiveChannel，包括SelectiveChannel和其他组合Channel。
 
@@ -169,7 +172,7 @@ SelectiveChannel的重试独立于其中的sub channel，当SelectiveChannel访�
 
 ## 使用SelectiveChannel
 
-SelectiveChannel的初始化和普通Channel基本一样，但Init不需要指定名字服务，因为SelectiveChannel通过AddChannel动态添加sub channel，而普通Channel通过名字服务动态管理server。
+SelectiveChannel的初始化和普通Channel基本一样，但Init不需要指定命名服务，因为SelectiveChannel通过AddChannel动态添加sub channel，而普通Channel通过命名服务动态管理server。
 
 ```c++
 #include <brpc/selective_channel.h>
@@ -203,11 +206,11 @@ if (schan.AddChannel(sub_channel, NULL/*ChannelHandle*/) != 0) {  // 第二个�
 
 访问SelectiveChannel的方式和普通Channel是一样的。
 
-## 例子: 往多个名字服务分流
+## 例子: 往多个命名服务分流
 
-一些场景中我们需要向多个名字服务下的机器分流，原因可能有：
+一些场景中我们需要向多个命名服务下的机器分流，原因可能有：
 
-- 完成同一个检索功能的机器被挂载到了不同的名字服务下。
+- 完成同一个检索功能的机器被挂载到了不同的命名服务下。
 - 机器被拆成了多个组，流量先分流给一个组，再分流到组内机器。组间的分流方式和组内有所不同。
 
 这都可以通过SelectiveChannel完成。
@@ -243,11 +246,11 @@ stub.FooMethod(&cntl, &request, &response, NULL);
 
 # PartitionChannel
 
-[PartitionChannel](https://github.com/brpc/brpc/blob/master/src/brpc/partition_channel.h)是特殊的ParallelChannel，它会根据名字服务中的tag自动建立对应分库的sub channel。这样用户就可以把所有的分库机器挂在一个名字服务内，通过tag来指定哪台机器对应哪个分库。示例代码见[example/partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/partition_echo_c++/)。
+[PartitionChannel](https://github.com/apache/brpc/blob/master/src/brpc/partition_channel.h)是特殊的ParallelChannel，它会根据命名服务中的tag自动建立对应分库的sub channel。这样用户就可以把所有的分库机器挂在一个命名服务内，通过tag来指定哪台机器对应哪个分库。示例代码见[example/partition_echo_c++](https://github.com/apache/brpc/tree/master/example/partition_echo_c++/)。
 
-ParititonChannel只能处理一种分库方法，当用户需要多种分库方法共存，或从一个分库方法平滑地切换为另一种分库方法时，可以使用DynamicPartitionChannel，它会根据不同的分库方式动态地建立对应的sub PartitionChannel，并根据容量把请求分配给不同的分库。示例代码见[example/dynamic_partition_echo_c++](https://github.com/brpc/brpc/tree/master/example/dynamic_partition_echo_c++/)。
+ParititonChannel只能处理一种分库方法，当用户需要多种分库方法共存，或从一个分库方法平滑地切换为另一种分库方法时，可以使用DynamicPartitionChannel，它会根据不同的分库方式动态地建立对应的sub PartitionChannel，并根据容量把请求分配给不同的分库。示例代码见[example/dynamic_partition_echo_c++](https://github.com/apache/brpc/tree/master/example/dynamic_partition_echo_c++/)。
 
-如果分库在不同的名字服务内，那么用户得自行用ParallelChannel组装，即每个sub channel对应一个分库（使用不同的名字服务）。ParellelChannel的使用方法见[上面](#ParallelChannel)。
+如果分库在不同的命名服务内，那么用户得自行用ParallelChannel组装，即每个sub channel对应一个分库（使用不同的命名服务）。ParellelChannel的使用方法见[上面](#ParallelChannel)。
 
 ## 使用PartitionChannel
 
@@ -336,7 +339,7 @@ TRACE: 09-06 10:40:42:   * 0 server.cpp:192] S[0]=0 S[1]=0 S[2]=0 [total=0]
     ...
 ```
 
-名字服务"file://server_list"的内容是：
+命名服务"file://server_list"的内容是：
 ```
 0.0.0.0:8004  0/3  # 表示3分库中的第一个分库，其他依次类推
 0.0.0.0:8004  1/3
@@ -401,7 +404,7 @@ TRACE: 09-06 10:57:15:   * 0 server.cpp:192] S[0]=208453 S[1]=276803 S[2]=0 [tot
 
 一次RPC要访问三次8004或四次8005，8004和8005流量比是3:4，说明Client以1:1的比例访问了3分库和4分库。这个比例关系取决于其容量。容量的计算是递归的：
 
-- 普通Channel的容量等于它其中所有server的容量之和。如果名字服务没有配置权值，单个server的容量为1。
+- 普通Channel的容量等于它其中所有server的容量之和。如果命名服务没有配置权值，单个server的容量为1。
 - ParallelChannel或PartitionChannel的容量等于它其中Sub Channel容量的最小值。
 - SelectiveChannel的容量等于它其中Sub Channel的容量之和。
 - DynamicPartitionChannel的容量等于它其中Sub PartitionChannel的容量之和。

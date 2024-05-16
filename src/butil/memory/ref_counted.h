@@ -137,7 +137,7 @@ class RefCounted : public subtle::RefCountedBase {
   ~RefCounted() {}
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(RefCounted<T>);
+  DISALLOW_COPY_AND_ASSIGN(RefCounted);
 };
 
 // Forward declaration.
@@ -283,6 +283,17 @@ class scoped_refptr {
   scoped_refptr(const scoped_refptr<U>& r) : ptr_(r.get()) {
     if (ptr_)
       ptr_->AddRef();
+  }
+
+  scoped_refptr(scoped_refptr<T>&& r) noexcept {
+    ptr_ = r.ptr_;
+    r.ptr_ = nullptr;
+  }
+
+  template <typename U>
+  scoped_refptr(scoped_refptr<U>&& r) noexcept {
+    ptr_ = r.ptr_;
+    r.ptr_ = nullptr;
   }
 
   ~scoped_refptr() {

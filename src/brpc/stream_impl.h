@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #ifndef  BRPC_STREAM_IMPL_H
 #define  BRPC_STREAM_IMPL_H
@@ -40,7 +42,8 @@ public:
 
     // --------------------- SocketConnection --------------
 
-    int AppendIfNotFull(const butil::IOBuf& msg);
+    int AppendIfNotFull(const butil::IOBuf& msg,
+                        const StreamWriteOptions* options = NULL);
     static int Create(const StreamOptions& options,
                       const StreamSettings *remote_settings,
                       StreamId *id);
@@ -58,13 +61,16 @@ public:
                     const timespec *due_time);
     int Wait(const timespec* due_time);
     void FillSettings(StreamSettings *settings);
-    static int SetFailed(StreamId id);
-    void Close();
+    static int SetFailed(StreamId id, int error_code, const char* reason_fmt, ...)
+        __attribute__ ((__format__ (__printf__, 3, 4)));
+    void Close(int error_code, const char* reason_fmt, ...)
+        __attribute__ ((__format__ (__printf__, 3, 4)));
 
 private:
 friend void StreamWait(StreamId stream_id, const timespec *due_time,
-                void (*on_writable)(StreamId, void*, int), void *arg);
+                       void (*on_writable)(StreamId, void*, int), void *arg);
 friend class MessageBatcher;
+friend struct butil::DefaultDeleter<Stream>;
     Stream();
     ~Stream();
     int Init(const StreamOptions options);
@@ -108,10 +114,13 @@ friend class MessageBatcher;
     ConnectMeta         _connect_meta;
     bool                _connected;
     bool                _closed;
+    int                 _error_code;
+    std::string         _error_text;
     
     bthread_mutex_t _congestion_control_mutex;
     size_t _produced;
     size_t _remote_consumed;
+    size_t _cur_buf_size;
     bthread_id_list_t _writable_wait_list;
 
     int64_t _local_consumed;

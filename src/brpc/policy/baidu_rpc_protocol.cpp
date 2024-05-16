@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Zhangyi Chen (chenzhangyi01@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
@@ -50,6 +51,9 @@ DEFINE_bool(baidu_protocol_use_fullname, true,
             "If this flag is true, baidu_std puts service.full_name in requests"
             ", otherwise puts service.name (required by jprotobuf).");
 
+DEFINE_bool(baidu_std_protocol_deliver_timeout_ms, false,
+            "If this flag is true, baidu_std puts timeout_ms in requests.");
+
 // Notes:
 // 1. 12-byte header [PRPC][body_size][meta_size]
 // 2. body_size and meta_size are in network byte order
@@ -58,9 +62,8 @@ DEFINE_bool(baidu_protocol_use_fullname, true,
 // 5. Not supported: chunk_info
 
 // Pack header into `buf'
-inline void PackRpcHeader(char* rpc_header, int meta_size, int payload_size) {
-    // supress strict-aliasing warning.
-    uint32_t* dummy = (uint32_t*)rpc_header;
+inline void PackRpcHeader(char* rpc_header, uint32_t meta_size, int payload_size) {
+    uint32_t* dummy = (uint32_t*)rpc_header;  // suppress strict-alias warning
     *dummy = *(uint32_t*)"PRPC";
     butil::RawPacker(rpc_header + 4)
         .pack32(meta_size + payload_size)
@@ -69,7 +72,7 @@ inline void PackRpcHeader(char* rpc_header, int meta_size, int payload_size) {
 
 static void SerializeRpcHeaderAndMeta(
     butil::IOBuf* out, const RpcMeta& meta, int payload_size) {
-    const int meta_size = meta.ByteSize();
+    const uint32_t meta_size = GetProtobufByteSize(meta);
     if (meta_size <= 244) { // most common cases
         char header_and_meta[12 + meta_size];
         PackRpcHeader(header_and_meta, meta_size, payload_size);
@@ -77,11 +80,11 @@ static void SerializeRpcHeaderAndMeta(
         ::google::protobuf::io::CodedOutputStream coded_out(&arr_out);
         meta.SerializeWithCachedSizes(&coded_out); // not calling ByteSize again
         CHECK(!coded_out.HadError());
-        out->append(header_and_meta, sizeof(header_and_meta));
+        CHECK_EQ(0, out->append(header_and_meta, sizeof(header_and_meta)));
     } else {
         char header[12];
         PackRpcHeader(header, meta_size, payload_size);
-        out->append(header, sizeof(header));
+        CHECK_EQ(0, out->append(header, sizeof(header)));
         butil::IOBufAsZeroCopyOutputStream buf_stream(out);
         ::google::protobuf::io::CodedOutputStream coded_out(&buf_stream);
         meta.SerializeWithCachedSizes(&coded_out);
@@ -138,19 +141,22 @@ void SendRpcResponse(int64_t correlation_id,
                      const google::protobuf::Message* req,
                      const google::protobuf::Message* res,
                      const Server* server,
-                     MethodStatus* method_status_raw,
-                     long start_parse_us) {
+                     MethodStatus* method_status,
+                     int64_t received_us) {
     ControllerPrivateAccessor accessor(cntl);
     Span* span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
     Socket* sock = accessor.get_sending_socket();
-    ScopedMethodStatus method_status(method_status_raw);
-    std::unique_ptr<Controller, LogErrorTextAndDelete> recycle_cntl(cntl);
+
     std::unique_ptr<const google::protobuf::Message> recycle_req(req);
     std::unique_ptr<const google::protobuf::Message> recycle_res(res);
-    ScopedRemoveConcurrency remove_concurrency_dummy(server, cntl);
+
+    std::unique_ptr<Controller, LogErrorTextAndDelete> recycle_cntl(cntl);
+    ConcurrencyRemover concurrency_remover(method_status, cntl, received_us);
+
+    ClosureGuard guard(brpc::NewCallback(cntl, &Controller::CallAfterRpcResp, req, res));
     
     StreamId response_stream_id = accessor.response_stream();
 
@@ -217,6 +223,15 @@ void SendRpcResponse(int64_t correlation_id,
         }
     }
 
+    if (cntl->has_response_user_fields() &&
+        !cntl->response_user_fields()->empty()) {
+        ::google::protobuf::Map<std::string, std::string>& user_fields
+            = *meta.mutable_user_fields();
+        user_fields.insert(cntl->response_user_fields()->begin(),
+                           cntl->response_user_fields()->end());
+
+    }
+
     butil::IOBuf res_buf;
     SerializeRpcHeaderAndMeta(&res_buf, meta, res_size + attached_size);
     if (append_body) {
@@ -229,24 +244,33 @@ void SendRpcResponse(int64_t correlation_id,
     if (span) {
         span->set_response_size(res_buf.size());
     }
-    if (stream_ptr) {
-        CHECK(accessor.remote_stream_settings() != NULL);
+    // Send rpc response over stream even if server side failed to create
+    // stream for some reason.
+    if(cntl->has_remote_stream()){
         // Send the response over stream to notify that this stream connection
         // is successfully built.
+        // Response_stream can be INVALID_STREAM_ID when error occurs.
         if (SendStreamData(sock, &res_buf,
                            accessor.remote_stream_settings()->stream_id(),
                            accessor.response_stream()) != 0) {
             const int errcode = errno;
-            PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
-            cntl->SetFailed(errcode, "Fail to write into %s",
-                            sock->description().c_str());
-            ((Stream*)stream_ptr->conn())->Close();
+            std::string error_text = butil::string_printf(64, "Fail to write into %s",
+                                                          sock->description().c_str());
+            PLOG_IF(WARNING, errcode != EPIPE) << error_text;
+            cntl->SetFailed(errcode,  "%s", error_text.c_str());
+            if(stream_ptr) {
+                ((Stream*)stream_ptr->conn())->Close(errcode, "%s",
+                                                     error_text.c_str());
+            }
             return;
         }
-        // Now it's ok the mark this server-side stream as connectted as all the
-        // written user data would follower the RPC response.
-        ((Stream*)stream_ptr->conn())->SetConnected();
-    } else {
+
+        if(stream_ptr) {
+            // Now it's ok the mark this server-side stream as connected as all the
+            // written user data would follower the RPC response.
+            ((Stream*)stream_ptr->conn())->SetConnected();
+        }
+    } else{
         // Have the risk of unlimited pending responses, in which case, tell
         // users to set max_concurrency.
         Socket::WriteOptions wopt;
@@ -264,12 +288,9 @@ void SendRpcResponse(int64_t correlation_id,
         // TODO: this is not sent
         span->set_sent_us(butil::cpuwide_time_us());
     }
-    if (method_status) {
-        method_status.release()->OnResponded(
-            !cntl->Failed(), butil::cpuwide_time_us() - start_parse_us);
-    }
 }
 
+namespace {
 struct CallMethodInBackupThreadArgs {
     ::google::protobuf::Service* service;
     const ::google::protobuf::MethodDescriptor* method;
@@ -278,6 +299,7 @@ struct CallMethodInBackupThreadArgs {
     ::google::protobuf::Message* response;
     ::google::protobuf::Closure* done;
 };
+}
 
 static void CallMethodInBackupThread(void* void_args) {
     CallMethodInBackupThreadArgs* args = (CallMethodInBackupThreadArgs*)void_args;
@@ -323,12 +345,12 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
 
     SampledRequest* sample = AskToBeSampled();
     if (sample) {
-        sample->set_service_name(request_meta.service_name());
-        sample->set_method_name(request_meta.method_name());
-        sample->set_compress_type((CompressType)meta.compress_type());
-        sample->set_protocol_type(PROTOCOL_BAIDU_STD);
-        sample->set_attachment_size(meta.attachment_size());
-        sample->set_authentication_data(meta.authentication_data());
+        sample->meta.set_service_name(request_meta.service_name());
+        sample->meta.set_method_name(request_meta.method_name());
+        sample->meta.set_compress_type((CompressType)meta.compress_type());
+        sample->meta.set_protocol_type(PROTOCOL_BAIDU_STD);
+        sample->meta.set_attachment_size(meta.attachment_size());
+        sample->meta.set_authentication_data(meta.authentication_data());
         sample->request = msg->payload;
         sample->submit(start_parse_us);
     }
@@ -348,6 +370,12 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
     if (request_meta.has_log_id()) {
         cntl->set_log_id(request_meta.log_id());
     }
+    if (request_meta.has_request_id()) {
+        cntl->set_request_id(request_meta.request_id());
+    }
+    if (request_meta.has_timeout_ms()) {
+        cntl->set_timeout_ms(request_meta.timeout_ms());
+    }
     cntl->set_request_compress_type((CompressType)meta.compress_type());
     accessor.set_server(server)
         .set_security_mode(security_mode)
@@ -356,10 +384,17 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         .set_local_side(socket->local_side())
         .set_auth_context(socket->auth_context())
         .set_request_protocol(PROTOCOL_BAIDU_STD)
+        .set_begin_time_us(msg->received_us())
         .move_in_server_receiving_sock(socket_guard);
 
     if (meta.has_stream_settings()) {
         accessor.set_remote_stream_settings(meta.release_stream_settings());
+    }
+
+    if (!meta.user_fields().empty()) {
+        for (const auto& it : meta.user_fields()) {
+            (*cntl->request_user_fields())[it.first] = it.second;
+        }
     }
 
     // Tag the bthread with this server's key for thread_local_data().
@@ -395,8 +430,9 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         }
         
         if (!server_accessor.AddConcurrency(cntl.get())) {
-            cntl->SetFailed(ELIMIT, "Reached server's max_concurrency=%d",
-                            server->options().max_concurrency);
+            cntl->SetFailed(
+                ELIMIT, "Reached server's max_concurrency=%d",
+                server->options().max_concurrency);
             break;
         }
 
@@ -439,31 +475,37 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         non_service_error.release();
         method_status = mp->status;
         if (method_status) {
-            if (!method_status->OnRequested()) {
-                cntl->SetFailed(ELIMIT, "Reached %s's max_concurrency=%d",
-                                mp->method->full_name().c_str(),
-                                method_status->max_concurrency());
+            int rejected_cc = 0;
+            if (!method_status->OnRequested(&rejected_cc, cntl.get())) {
+                cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
+                                mp->method->full_name().c_str(), rejected_cc);
                 break;
             }
         }
         google::protobuf::Service* svc = mp->service;
         const google::protobuf::MethodDescriptor* method = mp->method;
         accessor.set_method(method);
+
+
+        if (!server->AcceptRequest(cntl.get())) {
+            break;
+        }
+
         if (span) {
             span->ResetServerSpanName(method->full_name());
         }
-        const int reqsize = static_cast<int>(msg->payload.size());
+        const int req_size = static_cast<int>(msg->payload.size());
         butil::IOBuf req_buf;
         butil::IOBuf* req_buf_ptr = &msg->payload;
         if (meta.has_attachment_size()) {
-            if (reqsize < meta.attachment_size()) {
+            if (req_size < meta.attachment_size()) {
                 cntl->SetFailed(EREQUEST,
                     "attachment_size=%d is larger than request_size=%d",
-                     meta.attachment_size(), reqsize);
+                     meta.attachment_size(), req_size);
                 break;
             }
-            int att_size = reqsize - meta.attachment_size();
-            msg->payload.cutn(&req_buf, att_size);
+            int body_without_attachment_size = req_size - meta.attachment_size();
+            msg->payload.cutn(&req_buf, body_without_attachment_size);
             req_buf_ptr = &req_buf;
             cntl->request_attachment().swap(msg->payload);
         }
@@ -473,23 +515,24 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         if (!ParseFromCompressedData(*req_buf_ptr, req.get(), req_cmp_type)) {
             cntl->SetFailed(EREQUEST, "Fail to parse request message, "
                             "CompressType=%s, request_size=%d", 
-                            CompressTypeToCStr(req_cmp_type), reqsize);
+                            CompressTypeToCStr(req_cmp_type), req_size);
             break;
         }
         
-        // optional, just release resourse ASAP
-        msg.reset();
-        req_buf.clear();
-
         res.reset(svc->GetResponsePrototype(method).New());
         // `socket' will be held until response has been sent
         google::protobuf::Closure* done = ::brpc::NewCallback<
             int64_t, Controller*, const google::protobuf::Message*,
             const google::protobuf::Message*, const Server*,
-            MethodStatus*, long>(
+            MethodStatus*, int64_t>(
                 &SendRpcResponse, meta.correlation_id(), cntl.get(), 
                 req.get(), res.get(), server,
-                method_status, start_parse_us);
+                method_status, msg->received_us());
+
+        // optional, just release resource ASAP
+        msg.reset();
+        req_buf.clear();
+
         if (span) {
             span->set_start_callback_us(butil::cpuwide_time_us());
             span->AsParent();
@@ -513,7 +556,7 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
     // `socket' will be held until response has been sent
     SendRpcResponse(meta.correlation_id(), cntl.release(), 
                     req.release(), res.release(), server,
-                    method_status, -1);
+                    method_status, msg->received_us());
 }
 
 bool VerifyRpcRequest(const InputMessageBase* msg_base) {
@@ -551,21 +594,31 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
 
     const bthread_id_t cid = { static_cast<uint64_t>(meta.correlation_id()) };
     Controller* cntl = NULL;
+
+    StreamId remote_stream_id = meta.has_stream_settings() ? meta.stream_settings().stream_id(): INVALID_STREAM_ID;
+
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
             << "Fail to lock correlation_id=" << cid << ": " << berror(rc);
-        if (meta.has_stream_settings()) {
+        if (remote_stream_id != INVALID_STREAM_ID) {
             SendStreamRst(msg->socket(), meta.stream_settings().stream_id());
         }
         return;
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    if (meta.has_stream_settings()) {
+    if (remote_stream_id != INVALID_STREAM_ID) {
         accessor.set_remote_stream_settings(
                 new StreamSettings(meta.stream_settings()));
     }
+
+    if (!meta.user_fields().empty()) {
+        for (const auto& it : meta.user_fields()) {
+            (*cntl->response_user_fields())[it.first] = it.second;
+        }
+    }
+
     Span* span = accessor.span();
     if (span) {
         span->set_base_real_us(msg->base_real_us());
@@ -594,8 +647,8 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
                     meta.attachment_size(), res_size);
                 break;
             }
-            int att_size = res_size - meta.attachment_size();
-            msg->payload.cutn(&res_buf, att_size);
+            int body_without_attachment_size = res_size - meta.attachment_size();
+            msg->payload.cutn(&res_buf, body_without_attachment_size);
             res_buf_ptr = &res_buf;
             cntl->response_attachment().swap(msg->payload);
         }
@@ -614,7 +667,7 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
     } while (0);
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 
@@ -639,16 +692,19 @@ void PackRpcRequest(butil::IOBuf* req_buf,
                                        method->service()->name());
         request_meta->set_method_name(method->name());
         meta.set_compress_type(cntl->request_compress_type());
-    } else if (cntl->rpc_dump_meta()) {
+    } else if (cntl->sampled_request()) {
         // Replaying. Keep service-name as the one seen by server.
-        request_meta->set_service_name(cntl->rpc_dump_meta()->service_name());
-        request_meta->set_method_name(cntl->rpc_dump_meta()->method_name());
-        meta.set_compress_type(cntl->rpc_dump_meta()->compress_type());
+        request_meta->set_service_name(cntl->sampled_request()->meta.service_name());
+        request_meta->set_method_name(cntl->sampled_request()->meta.method_name());
+        meta.set_compress_type(cntl->sampled_request()->meta.compress_type());
     } else {
         return cntl->SetFailed(ENOMETHOD, "%s.method is NULL", __FUNCTION__);
     }
     if (cntl->has_log_id()) {
         request_meta->set_log_id(cntl->log_id());
+    }
+    if (!cntl->request_id().empty()) {
+        request_meta->set_request_id(cntl->request_id());
     }
     meta.set_correlation_id(correlation_id);
     StreamId request_stream_id = accessor.request_stream();
@@ -662,12 +718,26 @@ void PackRpcRequest(butil::IOBuf* req_buf,
         s->FillSettings(meta.mutable_stream_settings());
     }
 
+    if (cntl->has_request_user_fields() && !cntl->request_user_fields()->empty()) {
+        ::google::protobuf::Map<std::string, std::string>& user_fields
+            = *meta.mutable_user_fields();
+        user_fields.insert(cntl->request_user_fields()->begin(),
+                           cntl->request_user_fields()->end());
+    }
+
     // Don't use res->ByteSize() since it may be compressed
     const size_t req_size = request_body.length(); 
     const size_t attached_size = cntl->request_attachment().length();
     if (attached_size) {
         meta.set_attachment_size(attached_size);
     }
+
+    if (FLAGS_baidu_std_protocol_deliver_timeout_ms) {
+        if (accessor.real_timeout_ms() > 0) {
+            request_meta->set_timeout_ms(accessor.real_timeout_ms());
+        }
+    }
+
     Span* span = accessor.span();
     if (span) {
         request_meta->set_trace_id(span->trace_id());

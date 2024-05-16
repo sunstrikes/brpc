@@ -3,9 +3,9 @@ brpc可以分析程序中的热点函数。
 # 开启方法
 
 1. 链接`libtcmalloc_and_profiler.a`
-   1. 这么写也开启了tcmalloc，不建议单独链接cpu profiler而不链接tcmalloc，可能越界访问导致[crash](https://github.com/gperftools/gperftools/blob/master/README#L226)**。**可能由于tcmalloc不及时归还内存，越界访问不会crash。
+   1. 这么写也开启了tcmalloc，不建议单独链接cpu profiler而不链接tcmalloc，可能越界访问导致[crash](https://github.com/gperftools/gperftools/blob/master/README#L226).可能由于tcmalloc不及时归还内存，越界访问不会crash。
    2. 如果tcmalloc使用frame pointer而不是libunwind回溯栈，请确保在CXXFLAGS或CFLAGS中加上`-fno-omit-frame-pointer`，否则函数间的调用关系会丢失，最后产生的图片中都是彼此独立的函数方框。
-2. 定义宏BRPC_ENABLE_CPU_PROFILER, 一般加入编译参数-DBRPC_ENABLE_CPU_PROFILER。
+2. 定义宏BRPC_ENABLE_CPU_PROFILER, 一般加入编译参数-DBRPC_ENABLE_CPU_PROFILER。注意：BRPC_ENABLE_CPU_PROFILER宏需要定义在引用到brpc头文件(channel.h或server.h)的代码里。比如A模块引用B模块，B模块在实现中引用brpc头文件，必须在B模块的编译参数加上BRPC_ENABLE_CPU_PROFILER宏，在A模块加是没用的。
 3. 如果只是brpc client或没有使用brpc，看[这里](dummy_server.md)。 
 
  注意要关闭Server端的认证，否则可能会看到这个：
@@ -23,6 +23,21 @@ FATAL: 12-26 10:01:25:   * 0 [src/brpc/policy/giano_authenticator.cpp:65][429496
 WARNING: 12-26 10:01:25:   * 0 [src/brpc/input_messenger.cpp:132][4294969345] Authentication failed, remote side(127.0.0.1:22989) of sockfd=5, close it
 ```
 
+# 查看方法
+
+1. 通过builtin service的 /hotspots/cpu 页面查看
+1. 通过pprof 工具查看，如 tools/pprof --text localhost:9002/pprof/profile
+
+# 控制采样频率
+
+启动前设置环境变量：export CPUPROFILE_FREQUENCY=xxx
+
+默认值为: 100
+
+# 控制采样时间
+
+url加上?seconds=秒数，如/hotspots/cpu?seconds=5
+
 # 图示
 
 下图是一次运行cpu profiler后的结果：
@@ -34,11 +49,11 @@ WARNING: 12-26 10:01:25:   * 0 [src/brpc/input_messenger.cpp:132][4294969345] Au
 
 热点分析一般开始于找到最大的框最粗的线考察其来源及去向。
 
-cpu profiler的原理是在定期被调用的SIGPROF handler中采样所在线程的栈，由于handler（在linux 2.6后）会被随机地摆放于活跃线程的栈上运行，cpu profiler在运行一段时间后能以很大的概率采集到所有活跃线程中的活跃函数，最后根据栈代表的函数调用关系汇总为调用图，并把地址转换成符号，这就是我们看到的结果图了。采集频率由环境变量CPUPROFILE_FREQUENCY控制，默认100，即每秒钟100次或每10ms一次。。在实践中cpu profiler对原程序的影响不明显。
+cpu profiler的原理是在定期被调用的SIGPROF handler中采样所在线程的栈，由于handler（在linux 2.6后）会被随机地摆放于活跃线程的栈上运行，cpu profiler在运行一段时间后能以很大的概率采集到所有活跃线程中的活跃函数，最后根据栈代表的函数调用关系汇总为调用图，并把地址转换成符号，这就是我们看到的结果图了。采集频率由环境变量CPUPROFILE_FREQUENCY控制，默认100，即每秒钟100次或每10ms一次。在实践中cpu profiler对原程序的影响不明显。
 
 ![img](../images/echo_cpu_profiling.png)
 
-你也可以使用[pprof](https://github.com/brpc/brpc/blob/master/tools/pprof)或gperftools中的pprof进行profiling。
+在Linux下，你也可以使用[pprof](https://github.com/apache/brpc/blob/master/tools/pprof)或gperftools中的pprof进行profiling。
 
 比如`pprof --text localhost:9002 --seconds=5`的意思是统计运行在本机9002端口的server的cpu情况，时长5秒。一次运行的例子如下：
 
@@ -91,3 +106,14 @@ Total: 2954 samples
       37   1.3%  66.1%       37   1.3% memcpy
       35   1.2%  67.3%       35   1.2% brpc::Socket::Address
 ```
+
+# MacOS的额外配置
+
+在MacOS下，gperftools中的perl pprof脚本无法将函数地址转变成函数名，解决办法是：
+
+1. 安装[standalone pprof](https://github.com/google/pprof)，并把下载的pprof二进制文件路径写入环境变量GOOGLE_PPROF_BINARY_PATH中
+2. 安装llvm-symbolizer（将函数符号转化为函数名），直接用brew安装即可：`brew install llvm`
+
+# 火焰图
+
+若需要结果以火焰图的方式展示，请下载并安装[FlameGraph](https://github.com/brendangregg/FlameGraph)工具，将环境变量FLAMEGRAPH_PL_PATH正确设置到本地的/path/to/flamegraph.pl后启动server即可。

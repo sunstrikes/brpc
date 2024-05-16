@@ -1,21 +1,21 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen(chenzhangyi01@baidu.com)
-//          Ge,Jun (gejun@baidu.com)
 
-#include <stdlib.h>                     // abort()
 #include "butil/macros.h"
 #include "butil/logging.h"
 #include <pthread.h>
@@ -72,9 +72,8 @@ struct LessThanByName {
 static void BuildHttpMethodMaps() {
     for (size_t i = 0; i < ARRAY_SIZE(g_method_pairs); ++i) {
         const int method = (int)g_method_pairs[i].method;
-        if (method < 0 || method > (int)ARRAY_SIZE(g_method2str_map)) {
-            abort();
-        }
+        RELEASE_ASSERT(method >= 0 &&
+                       method <= (int)ARRAY_SIZE(g_method2str_map));
         g_method2str_map[method] = g_method_pairs[i].str;
      }
     std::sort(g_method_pairs, g_method_pairs + ARRAY_SIZE(g_method_pairs),
@@ -82,10 +81,9 @@ static void BuildHttpMethodMaps() {
     char last_fc = '\0';
     for (size_t i = 0; i < ARRAY_SIZE(g_method_pairs); ++i) {
         char fc = g_method_pairs[i].str[0];
-        if (fc < 'A' || fc > 'Z') {
-            LOG(ERROR) << "Invalid method_name=" << g_method_pairs[i].str;
-            abort();
-        }
+        RELEASE_ASSERT_VERBOSE(fc >= 'A' && fc <= 'Z',
+                               "Invalid method_name=%s",
+                               g_method_pairs[i].str);
         if (fc != last_fc) {
             last_fc = fc;
             g_first_char_index[fc - 'A'] = (uint8_t)(i + 1);

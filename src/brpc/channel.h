@@ -1,19 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
-//          Rujie Jiang (jiangrujie@baidu.com)
 
 #ifndef BRPC_CHANNEL_H
 #define BRPC_CHANNEL_H
@@ -21,10 +22,11 @@
 // To brpc developers: This is a header included by user, don't depend
 // on internal structures, use opaque pointers instead.
 
-#include <ostream>                               // std::ostream
-#include "bthread/errno.h"                       // Redefine errno
-#include "butil/intrusive_ptr.hpp"               // butil::intrusive_ptr
-#include "brpc/ssl_option.h"                // ChannelSSLOptions
+#include <ostream>                          // std::ostream
+#include "bthread/errno.h"                  // Redefine errno
+#include "butil/intrusive_ptr.hpp"          // butil::intrusive_ptr
+#include "butil/ptr_container.h"
+#include "brpc/ssl_options.h"               // ChannelSSLOptions
 #include "brpc/channel_base.h"              // ChannelBase
 #include "brpc/adaptive_protocol_type.h"    // AdaptiveProtocolType
 #include "brpc/adaptive_connection_type.h"  // AdaptiveConnectionType
@@ -68,6 +70,12 @@ struct ChannelOptions {
     // Maximum: INT_MAX
     int max_retry;
     
+    // When the error rate of a server node is too high, isolate the node. 
+    // Note that this isolation is GLOBAL, the node will become unavailable 
+    // for all channels running in this process during the isolation.
+    // Default: false
+    bool enable_circuit_breaker;
+
     // Serialization protocol, defined in src/brpc/options.proto
     // NOTE: You can assign name of the protocol to this field as well, for
     // Example: options.protocol = "baidu_std";
@@ -90,8 +98,14 @@ struct ChannelOptions {
     bool log_succeed_without_server;
 
     // SSL related options. Refer to `ChannelSSLOptions' for details
-    ChannelSSLOptions ssl_options;
-    
+    bool has_ssl_options() const { return _ssl_options != NULL; }
+    const ChannelSSLOptions& ssl_options() const { return *_ssl_options; }
+    ChannelSSLOptions* mutable_ssl_options();
+
+    // Let this channel use rdma rather than tcp.
+    // Default: false
+    bool use_rdma;
+
     // Turn on authentication for this channel if `auth' is not NULL.
     // Note `auth' will not be deleted by channel and must remain valid when
     // the channel is being used.
@@ -99,9 +113,10 @@ struct ChannelOptions {
     const Authenticator* auth;
 
     // Customize the error code that should be retried. The interface is
-    // defined src/brpc/retry_policy.h
+    // defined in src/brpc/retry_policy.h
     // This object is NOT owned by channel and should remain valid when
     // channel is used.
+    // Default: NULL
     const RetryPolicy* retry_policy;
 
     // Filter ServerNodes (i.e. based on `tag' field of `ServerNode')
@@ -109,7 +124,19 @@ struct ChannelOptions {
     // in src/brpc/naming_service_filter.h
     // This object is NOT owned by channel and should remain valid when
     // channel is used.
+    // Default: NULL
     const NamingServiceFilter* ns_filter;
+
+    // Channels with same connection_group share connections.
+    // In other words, set to a different value to stop sharing connections.
+    // Case-sensitive, leading and trailing spaces are ignored.
+    // Default: ""
+    std::string connection_group;
+
+private:
+    // SSLOptions is large and not often used, allocate it on heap to
+    // prevent ChannelOptions from being bloated in most cases.
+    butil::PtrContainer<ChannelSSLOptions> _ssl_options;
 };
 
 // A Channel represents a communication line to one server or multiple servers
@@ -126,7 +153,9 @@ friend class Controller;
 friend class SelectiveChannel;
 public:
     Channel(ProfilerLinker = ProfilerLinker());
-    ~Channel();
+    virtual ~Channel();
+
+    DISALLOW_COPY_AND_ASSIGN(Channel);
 
     // Connect this channel to a single server whose address is given by the
     // first parameter. Use default options if `options' is NULL.
@@ -146,6 +175,8 @@ public:
     // Supported load balancer:
     //   rr                           # round robin, choose next server
     //   random                       # randomly choose a server
+    //   wr                           # weighted random
+    //   wrr                          # weighted round robin
     //   la                           # locality aware
     //   c_murmurhash/c_md5           # consistent hashing with murmurhash3/md5
     //   "" or NULL                   # treat `naming_service_url' as `server_addr_and_port'
@@ -188,8 +219,13 @@ protected:
     static void CallMethodImpl(Controller* controller, SharedLoadBalancer* lb);
 
     int InitChannelOptions(const ChannelOptions* options);
+    int InitSingle(const butil::EndPoint& server_addr_and_port,
+                   const char* raw_server_address,
+                   const ChannelOptions* options,
+                   int raw_port = -1);
 
-    std::string _raw_server_address;
+    std::string _service_name;
+    std::string _scheme;
     butil::EndPoint _server_address;
     SocketId _server_id;
     Protocol::SerializeRequest _serialize_request;

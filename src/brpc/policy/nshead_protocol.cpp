@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
@@ -24,6 +26,7 @@
 #include "brpc/socket.h"                   // Socket
 #include "brpc/server.h"                   // Server
 #include "brpc/span.h"
+#include "brpc/rpc_dump.h"
 #include "brpc/details/server_private_accessor.h"
 #include "brpc/details/controller_private_accessor.h"
 #include "brpc/nshead_service.h"
@@ -40,7 +43,7 @@ namespace brpc {
 
 NsheadClosure::NsheadClosure(void* additional_space)
     : _server(NULL)
-    , _start_parse_us(0)
+    , _received_us(0)
     , _do_respond(true)
     , _additional_space(additional_space) {
 }
@@ -64,7 +67,6 @@ public:
 void NsheadClosure::Run() {
     // Recycle itself after `Run'
     std::unique_ptr<NsheadClosure, DeleteNsheadClosure> recycle_ctx(this);
-    ScopedRemoveConcurrency remove_concurrency_dummy(_server, &_controller);
 
     ControllerPrivateAccessor accessor(&_controller);
     Span* span = accessor.span();
@@ -72,7 +74,8 @@ void NsheadClosure::Run() {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
     Socket* sock = accessor.get_sending_socket();
-    ScopedMethodStatus method_status(_server->options().nshead_service->_status);
+    MethodStatus* method_status = _server->options().nshead_service->_status;
+    ConcurrencyRemover concurrency_remover(method_status, &_controller, _received_us);
     if (!method_status) {
         // Judge errors belongings.
         // may not be accurate, but it does not matter too much.
@@ -123,10 +126,6 @@ void NsheadClosure::Run() {
         // TODO: this is not sent
         span->set_sent_us(butil::cpuwide_time_us());
     }
-    if (method_status) {
-        method_status.release()->OnResponded(
-            !_controller.Failed(), butil::cpuwide_time_us() - cpuwide_start_us());
-    }
 }
 
 void NsheadClosure::SetMethodName(const std::string& full_method_name) {
@@ -170,6 +169,7 @@ ParseResult ParseNsheadMessage(butil::IOBuf* source,
     return MakeMessage(msg);
 }
 
+namespace {
 struct CallMethodInBackupThreadArgs {
     NsheadService* service;
     const Server* server;
@@ -178,6 +178,7 @@ struct CallMethodInBackupThreadArgs {
     NsheadMessage* response;
     NsheadClosure* done;
 };
+}
 
 static void CallMethodInBackupThread(void* void_args) {
     CallMethodInBackupThreadArgs* args = (CallMethodInBackupThreadArgs*)void_args;
@@ -231,6 +232,15 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
         return;
     }
 
+    // for nshead sample request
+    SampledRequest* sample = AskToBeSampled();
+    if (sample) {
+        sample->meta.set_protocol_type(PROTOCOL_NSHEAD);
+        sample->meta.set_nshead(p, sizeof(nshead_t)); // nshead
+        sample->request = msg->payload;
+        sample->submit(start_parse_us);
+    }
+
     // Switch to service-specific error.
     non_service_error.release();
     MethodStatus* method_status = service->_status;
@@ -249,7 +259,7 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
 
     req->head = *req_head;
     msg->payload.swap(req->body);
-    nshead_done->_start_parse_us = start_parse_us;
+    nshead_done->_received_us = msg->received_us();
     nshead_done->_server = server;
     
     ServerPrivateAccessor server_accessor(server);
@@ -266,6 +276,7 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
         .set_remote_side(socket->remote_side())
         .set_local_side(socket->local_side())
         .set_request_protocol(PROTOCOL_NSHEAD)
+        .set_begin_time_us(msg->received_us())
         .move_in_server_receiving_sock(socket_guard);
 
     // Tag the bthread with this server's key for thread_local_data().
@@ -296,8 +307,9 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
             break;
         }
         if (!server_accessor.AddConcurrency(cntl)) {
-            cntl->SetFailed(ELIMIT, "Reached server's max_concurrency=%d",
-                            server->options().max_concurrency);
+            cntl->SetFailed(
+                ELIMIT, "Reached server's max_concurrency=%d",
+                server->options().max_concurrency);
             break;
         }
         if (FLAGS_usercode_in_pthread && TooManyUserCode()) {
@@ -305,10 +317,12 @@ void ProcessNsheadRequest(InputMessageBase* msg_base) {
                             " -usercode_in_pthread is on");
             break;
         }
+        if (!server->AcceptRequest(cntl)) {
+            break;
+        }
     } while (false);
 
-    msg.reset();  // optional, just release resourse ASAP
-    // `socket' will be held until response has been sent
+    msg.reset();  // optional, just release resource ASAP
     if (span) {
         span->ResetServerSpanName(service->_cached_name);
         span->set_start_callback_us(butil::cpuwide_time_us());
@@ -358,7 +372,7 @@ void ProcessNsheadResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 
@@ -376,7 +390,6 @@ void SerializeNsheadRequest(butil::IOBuf* request_buf, Controller* cntl,
     if (req_base == NULL) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
-    ControllerPrivateAccessor accessor(cntl);
     if (req_base->GetDescriptor() != NsheadMessage::descriptor()) {
         return cntl->SetFailed(EINVAL, "Type of request must be NsheadMessage");
     }
@@ -404,7 +417,7 @@ void PackNsheadRequest(
     const butil::IOBuf& request,
     const Authenticator*) {
     ControllerPrivateAccessor accessor(cntl);
-    if (accessor.connection_type() == CONNECTION_TYPE_SINGLE) {
+    if (cntl->connection_type() == CONNECTION_TYPE_SINGLE) {
         return cntl->SetFailed(
             EINVAL, "nshead protocol can't work with CONNECTION_TYPE_SINGLE");
     }

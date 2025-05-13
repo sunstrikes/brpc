@@ -38,12 +38,17 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-mesalink,nodebugsymbols -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,with-thrift,with-rdma,with-mesalink,with-bthread-tracer,with-debug-bthread-sche-safety,with-debug-lock,with-asan,nodebugsymbols,werror -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
 WITH_THRIFT=0
 WITH_RDMA=0
 WITH_MESALINK=0
+WITH_BTHREAD_TRACER=0
+WITH_ASAN=0
+BRPC_DEBUG_BTHREAD_SCHE_SAFETY=0
 DEBUGSYMBOLS=-g
+WERROR=
+BRPC_DEBUG_LOCK=0
 
 if [ $? != 0 ] ; then >&2 $ECHO "Terminating..."; exit 1 ; fi
 
@@ -67,7 +72,12 @@ while true; do
         --with-thrift) WITH_THRIFT=1; shift 1 ;;
         --with-rdma) WITH_RDMA=1; shift 1 ;;
         --with-mesalink) WITH_MESALINK=1; shift 1 ;;
+        --with-bthread-tracer) WITH_BTHREAD_TRACER=1; shift 1 ;;
+        --with-debug-bthread-sche-safety ) BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1; shift 1 ;;
+        --with-debug-lock ) BRPC_DEBUG_LOCK=1; shift 1 ;;
+        --with-asan) WITH_ASAN=1; shift 1 ;;
         --nodebugsymbols ) DEBUGSYMBOLS=; shift 1 ;;
+        --werror ) WERROR=-Werror; shift 1 ;;
         -- ) shift; break ;;
         * ) break ;;
     esac
@@ -198,6 +208,8 @@ if [ "$SYSTEM" = "Darwin" ]; then
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_ProfilerStop"
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,__Z13GetStackTracePPvii"
 	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_RegisterThriftProtocol"
+	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_mallctl"
+	DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -Wl,-U,_malloc_stats_print"
 fi
 append_linking() {
     if [ -f $1/lib${2}.a ]; then
@@ -251,15 +263,6 @@ fi
 PROTOC=$(find_bin_or_die protoc)
 
 GFLAGS_HDR=$(find_dir_of_header_or_die gflags/gflags.h)
-# namespace of gflags may not be google, grep it from source.
-GFLAGS_NS=$(grep "namespace [_A-Za-z0-9]\+ {" $GFLAGS_HDR/gflags/gflags_declare.h | head -1 | awk '{print $2}')
-if [ "$GFLAGS_NS" = "GFLAGS_NAMESPACE" ]; then
-    GFLAGS_NS=$(grep "#define GFLAGS_NAMESPACE [_A-Za-z0-9]\+" $GFLAGS_HDR/gflags/gflags_declare.h | head -1 | awk '{print $3}')
-fi
-if [ -z "$GFLAGS_NS" ]; then
-    >&2 $ECHO "Fail to grep namespace of gflags source $GFLAGS_HDR/gflags/gflags_declare.h"
-    exit 1
-fi
 
 PROTOBUF_HDR=$(find_dir_of_header_or_die google/protobuf/message.h)
 PROTOBUF_VERSION=$(grep '#define GOOGLE_PROTOBUF_VERSION [0-9]\+' $PROTOBUF_HDR/google/protobuf/stubs/common.h | awk '{print $3}')
@@ -344,10 +347,34 @@ else
     CXXFLAGS="-std=c++0x"
 fi
 
+CPPFLAGS=
+
+if [ $WITH_ASAN != 0 ]; then
+  CPPFLAGS="${CPPFLAGS} -fsanitize=address"
+  DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -fsanitize=address"
+fi
+
 LEVELDB_HDR=$(find_dir_of_header_or_die leveldb/db.h)
 
-HDRS=$($ECHO "$GFLAGS_HDR\n$PROTOBUF_HDR\n$ABSL_HDR\n$LEVELDB_HDR\n$OPENSSL_HDR" | sort | uniq)
-LIBS=$($ECHO "$GFLAGS_LIB\n$PROTOBUF_LIB\n$ABSL_LIB\n$LEVELDB_LIB\n$OPENSSL_LIB\n$SNAPPY_LIB" | sort | uniq)
+if [ $WITH_BTHREAD_TRACER != 0 ]; then
+    if [ "$SYSTEM" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+        >&2 $ECHO "bthread tracer is only supported on Linux x86_64 platform"
+        exit 1
+    fi
+    LIBUNWIND_HDR=$(find_dir_of_header_or_die libunwind.h)
+    LIBUNWIND_LIB=$(find_dir_of_lib_or_die unwind)
+
+    CPPFLAGS="${CPPFLAGS} -DBRPC_BTHREAD_TRACER"
+
+    if [ -f "$LIBUNWIND_LIB/libunwind.$SO" ]; then
+        DYNAMIC_LINKINGS="$DYNAMIC_LINKINGS -lunwind -lunwind-x86_64"
+    else
+        STATIC_LINKINGS="$STATIC_LINKINGS -lunwind -lunwind-x86_64"
+    fi
+fi
+
+HDRS=$($ECHO "$LIBUNWIND_HDR\n$GFLAGS_HDR\n$PROTOBUF_HDR\n$ABSL_HDR\n$LEVELDB_HDR\n$OPENSSL_HDR" | sort | uniq)
+LIBS=$($ECHO "$LIBUNWIND_LIB\n$GFLAGS_LIB\n$PROTOBUF_LIB\n$ABSL_LIB\n$LEVELDB_LIB\n$OPENSSL_LIB\n$SNAPPY_LIB" | sort | uniq)
 
 absent_in_the_list() {
     TMP=`$ECHO "$1\n$2" | sort | uniq`
@@ -405,7 +432,7 @@ append_to_output "STATIC_LINKINGS=$STATIC_LINKINGS"
 append_to_output "DYNAMIC_LINKINGS=$DYNAMIC_LINKINGS"
 
 # CPP means C PreProcessing, not C PlusPlus
-CPPFLAGS="-DBRPC_WITH_GLOG=$WITH_GLOG -DGFLAGS_NS=$GFLAGS_NS"
+CPPFLAGS="${CPPFLAGS} -DBRPC_WITH_GLOG=$WITH_GLOG -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=$BRPC_DEBUG_BTHREAD_SCHE_SAFETY -DBRPC_DEBUG_LOCK=$BRPC_DEBUG_LOCK"
 
 # Avoid over-optimizations of TLS variables by GCC>=4.8
 # See: https://github.com/apache/brpc/issues/1693
@@ -413,6 +440,9 @@ CPPFLAGS="${CPPFLAGS} -D__const__=__unused__"
 
 if [ ! -z "$DEBUGSYMBOLS" ]; then
     CPPFLAGS="${CPPFLAGS} $DEBUGSYMBOLS"
+fi
+if [ ! -z "$WERROR" ]; then
+    CPPFLAGS="${CPPFLAGS} $WERROR"
 fi
 if [ "$SYSTEM" = "Darwin" ]; then
     CPPFLAGS="${CPPFLAGS} -Wno-deprecated-declarations -Wno-inconsistent-missing-override"
@@ -500,7 +530,10 @@ append_to_output "ifeq (\$(NEED_GPERFTOOLS), 1)"
 TCMALLOC_LIB=$(find_dir_of_lib tcmalloc_and_profiler)
 if [ -z "$TCMALLOC_LIB" ]; then
     append_to_output "    \$(error \"Fail to find gperftools\")"
+elif [ $WITH_ASAN != 0 ]; then
+    append_to_output "    \$(error \"gperftools is not compatible with ASAN\")"
 else
+    append_to_output "    CPPFLAGS+=-DBRPC_ENABLE_CPU_PROFILER"
     append_to_output_libs "$TCMALLOC_LIB" "    "
     if [ -f $TCMALLOC_LIB/libtcmalloc.$SO ]; then
         append_to_output "    DYNAMIC_LINKINGS+=-ltcmalloc_and_profiler"

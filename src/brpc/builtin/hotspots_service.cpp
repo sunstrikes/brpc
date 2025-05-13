@@ -33,8 +33,8 @@
 #include "brpc/details/tcmalloc_extension.h"
 
 extern "C" {
-int __attribute__((weak)) ProfilerStart(const char* fname);
-void __attribute__((weak)) ProfilerStop();
+int BAIDU_WEAK ProfilerStart(const char* fname);
+void BAIDU_WEAK ProfilerStop();
 }
 
 namespace bthread {
@@ -68,7 +68,6 @@ static DisplayType StringToDisplayType(const std::string& val) {
     static std::once_flag flag;
     std::call_once(flag, []() {
         display_type_map = new butil::CaseIgnoredFlatMap<DisplayType>;
-        display_type_map->init(10);
         (*display_type_map)["dot"] = DisplayType::kDot;
 #if defined(OS_LINUX)
         (*display_type_map)["flame"] = DisplayType::kFlameGraph;
@@ -496,7 +495,7 @@ static void DisplayResult(Controller* cntl,
         cmd_builder << "--base " << *base_name << ' ';
     }
 
-    cmd_builder << GetProgramName() << " " << prof_name;
+    cmd_builder << GetProgramPath() << " " << prof_name;
 
     if (display_type == DisplayType::kFlameGraph) {
         // For flamegraph, we don't care about pprof error msg, 
@@ -512,7 +511,7 @@ static void DisplayResult(Controller* cntl,
     if (base_name) {
         cmd_builder << "-base " << *base_name << ' ';
     }
-    cmd_builder << GetProgramName() << " " << prof_name << " 2>&1 ";
+    cmd_builder << GetProgramPath() << " " << prof_name << " 2>&1 ";
 #endif
 
     const std::string cmd = cmd_builder.str();

@@ -27,6 +27,7 @@ namespace bvar {
 DECLARE_int32(bvar_latency_p1);
 DECLARE_int32(bvar_latency_p2);
 DECLARE_int32(bvar_latency_p3);
+DECLARE_uint32(max_multi_dimension_stats_count);
 
 static const std::string ALLOW_UNUSED METRIC_TYPE_COUNTER = "counter";
 static const std::string ALLOW_UNUSED METRIC_TYPE_SUMMARY = "summary";
@@ -37,6 +38,7 @@ template <typename T>
 inline
 MultiDimension<T>::MultiDimension(const key_type& labels)
     : Base(labels)
+    , _max_stats_count(FLAGS_max_multi_dimension_stats_count)
 {
     _metric_map.Modify(init_flatmap);
 }
@@ -45,9 +47,8 @@ template <typename T>
 inline
 MultiDimension<T>::MultiDimension(const butil::StringPiece& name,
                                   const key_type& labels)
-    : Base(labels)
+    : MultiDimension(labels)
 {
-    _metric_map.Modify(init_flatmap);
     this->expose(name);
 }
 
@@ -56,9 +57,8 @@ inline
 MultiDimension<T>::MultiDimension(const butil::StringPiece& prefix,
                                   const butil::StringPiece& name,
                                   const key_type& labels)
-    : Base(labels)
+    : MultiDimension(labels)
 {
-    _metric_map.Modify(init_flatmap);
     this->expose_as(prefix, name);
 }
 
@@ -190,8 +190,8 @@ T* MultiDimension<T>::get_stats_impl(const key_type& labels_value, STATS_OP stat
             return nullptr;
         }
 
-        if (metric_map_ptr->size() > MAX_MULTI_DIMENSION_STATS_COUNT) {
-            LOG(ERROR) << "Too many stats seen, overflow detected, max stats count:" << MAX_MULTI_DIMENSION_STATS_COUNT;
+        if (metric_map_ptr->size() > _max_stats_count) {
+            LOG(ERROR) << "Too many stats seen, overflow detected, max stats count=" << _max_stats_count;
             return nullptr;
         }
     }
@@ -252,7 +252,7 @@ size_t MultiDimension<T>::dump(Dumper* dumper, const DumpOptions* options) {
         bvar->describe(oss, options->quote_string);
         std::ostringstream oss_key;
         make_dump_key(oss_key, label_name);
-        if (!dumper->dump(oss_key.str(), oss.str())) {
+        if (!dumper->dump_mvar(oss_key.str(), oss.str())) {
             continue;
         }
         n++;
@@ -269,20 +269,20 @@ size_t MultiDimension<bvar::LatencyRecorder>::dump(Dumper* dumper, const DumpOpt
         return 0;
     }
     size_t n = 0;
+    // To meet prometheus specification, we must guarantee no second TYPE line for one metric name
+
+    // latency comment
+    dumper->dump_comment(name() + "_latency", METRIC_TYPE_GAUGE);
     for (auto &label_name : label_names) {
         bvar::LatencyRecorder* bvar = get_stats_impl(label_name);
         if (!bvar) {
             continue;
         }
 
-        // latency comment
-        if (!dumper->dump_comment(name() + "_latency", METRIC_TYPE_GAUGE)) {
-            continue;
-        }
         // latency
         std::ostringstream oss_latency_key;
         make_dump_key(oss_latency_key, label_name, "_latency");
-        if (dumper->dump(oss_latency_key.str(), std::to_string(bvar->latency()))) {
+        if (dumper->dump_mvar(oss_latency_key.str(), std::to_string(bvar->latency()))) {
             n++;
         }
         // latency_percentiles
@@ -291,53 +291,62 @@ size_t MultiDimension<bvar::LatencyRecorder>::dump(Dumper* dumper, const DumpOpt
         for (auto lp : latency_percentiles) {
             std::ostringstream oss_lp_key;
             make_dump_key(oss_lp_key, label_name, "_latency", lp);
-            if (dumper->dump(oss_lp_key.str(), std::to_string(bvar->latency_percentile(lp / 100.0)))) {
+            if (dumper->dump_mvar(oss_lp_key.str(), std::to_string(bvar->latency_percentile(lp / 100.0)))) {
                 n++;
             }
         }
         // 999
         std::ostringstream oss_p999_key;
         make_dump_key(oss_p999_key, label_name, "_latency", 999);
-        if (dumper->dump(oss_p999_key.str(), std::to_string(bvar->latency_percentile(0.999)))) {
+        if (dumper->dump_mvar(oss_p999_key.str(), std::to_string(bvar->latency_percentile(0.999)))) {
             n++;
         }
         // 9999
         std::ostringstream oss_p9999_key;
         make_dump_key(oss_p9999_key, label_name, "_latency", 9999);
-        if (dumper->dump(oss_p9999_key.str(), std::to_string(bvar->latency_percentile(0.9999)))) {
+        if (dumper->dump_mvar(oss_p9999_key.str(), std::to_string(bvar->latency_percentile(0.9999)))) {
             n++;
         }
+    }
 
-        // max_latency comment
-        if (!dumper->dump_comment(name() + "_max_latency", METRIC_TYPE_GAUGE)) {
+    // max_latency comment
+    dumper->dump_comment(name() + "_max_latency", METRIC_TYPE_GAUGE);
+    for (auto &label_name : label_names) {
+        bvar::LatencyRecorder* bvar = get_stats_impl(label_name);
+        if (!bvar) {
             continue;
         }
-        // max_latency
         std::ostringstream oss_max_latency_key;
         make_dump_key(oss_max_latency_key, label_name, "_max_latency");
-        if (dumper->dump(oss_max_latency_key.str(), std::to_string(bvar->max_latency()))) {
+        if (dumper->dump_mvar(oss_max_latency_key.str(), std::to_string(bvar->max_latency()))) {
             n++;
         }
-        
-        // qps comment
-        if (!dumper->dump_comment(name() + "_qps", METRIC_TYPE_GAUGE)) {
+    }
+
+    // qps comment
+    dumper->dump_comment(name() + "_qps", METRIC_TYPE_GAUGE);
+    for (auto &label_name : label_names) {
+        bvar::LatencyRecorder* bvar = get_stats_impl(label_name);
+        if (!bvar) {
             continue;
         }
-        // qps
         std::ostringstream oss_qps_key;
         make_dump_key(oss_qps_key, label_name, "_qps");
-        if (dumper->dump(oss_qps_key.str(), std::to_string(bvar->qps()))) {
+        if (dumper->dump_mvar(oss_qps_key.str(), std::to_string(bvar->qps()))) {
             n++;
         }
+    }
 
-        // qps comment
-        if (!dumper->dump_comment(name() + "_count", METRIC_TYPE_COUNTER)) {
+    // count comment
+    dumper->dump_comment(name() + "_count", METRIC_TYPE_COUNTER);
+    for (auto &label_name : label_names) {
+        bvar::LatencyRecorder* bvar = get_stats_impl(label_name);
+        if (!bvar) {
             continue;
         }
-        // count
         std::ostringstream oss_count_key;
         make_dump_key(oss_count_key, label_name, "_count");
-        if (dumper->dump(oss_count_key.str(), std::to_string(bvar->count()))) {
+        if (dumper->dump_mvar(oss_count_key.str(), std::to_string(bvar->count()))) {
             n++;
         }
     }
@@ -372,7 +381,7 @@ void MultiDimension<T>::make_labels_kvpair_string(std::ostream& os,
         comma[0] = ',';
     }
     if (quantile > 0) {
-        os << ",quantile=\"" << quantile << "\"";
+        os << comma << "quantile=\"" << quantile << "\"";
     }
     os << "}";
 }

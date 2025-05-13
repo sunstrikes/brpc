@@ -811,10 +811,12 @@ butil::Mutex s_mutex;
 std::unordered_map<std::string, std::string> m;
 std::unordered_map<std::string, int64_t> int_map;
 
+
 class RedisServiceImpl : public brpc::RedisService {
 public:
-    RedisServiceImpl()
-        : _batch_count(0) {}
+    RedisServiceImpl(std::string password)
+        : _batch_count(0)
+        , _password(std::move(password)) {}
 
     brpc::RedisCommandHandlerResult OnBatched(const std::vector<butil::StringPiece>& args,
                    brpc::RedisReply* output, bool flush_batched) {
@@ -864,8 +866,49 @@ public:
 
     std::vector<std::vector<std::string> > _batched_command;
     int _batch_count;
+    std::string _password;
 };
 
+
+class AuthSession : public brpc::Destroyable {
+public:
+    explicit AuthSession(std::string password)
+        :  _password(std::move(password)) {}
+
+    void Destroy() override {
+        delete this;
+    }   
+
+    const std::string _password;
+};
+
+class AuthCommandHandler : public brpc::RedisCommandHandler {
+public:
+    AuthCommandHandler(RedisServiceImpl* rs)
+        : _rs(rs) {}    
+
+    brpc::RedisCommandHandlerResult Run(brpc::RedisConnContext* ctx,
+                                        const std::vector<butil::StringPiece>& args,
+                                        brpc::RedisReply* output,
+                                        bool flush_batched) {
+        if (args.size() < 1) {
+            output->SetError("ERR wrong number of arguments for 'AUTH' command");
+            return brpc::REDIS_CMD_HANDLED;
+        }
+        const std::string password(args[1].data(), args[1].size());
+        if (_rs->_password != password) {
+            output->SetError("ERR invalid username/password");
+            return brpc::REDIS_CMD_HANDLED;
+        }
+        auto auth_session = new AuthSession(password);
+        ctx->reset_session(auth_session);
+        output->SetStatus("OK");
+        return brpc::REDIS_CMD_HANDLED;
+    }
+
+private:
+    RedisServiceImpl* _rs;
+};
 
 class SetCommandHandler : public brpc::RedisCommandHandler {
 public:
@@ -873,9 +916,19 @@ public:
         : _rs(rs)
         , _batch_process(batch_process) {}
 
-    brpc::RedisCommandHandlerResult Run(const std::vector<butil::StringPiece>& args,
+    brpc::RedisCommandHandlerResult Run(brpc::RedisConnContext* ctx,
+                                        const std::vector<butil::StringPiece>& args,
                                         brpc::RedisReply* output,
                                         bool flush_batched) {
+        if (!ctx->session) {
+            output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
+        AuthSession* session = static_cast<AuthSession*>(ctx->session);
+        if (!session || (session->_password != _rs->_password)) {
+            output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
         if (args.size() < 3) {
             output->SetError("ERR wrong number of arguments for 'set' command");
             return brpc::REDIS_CMD_HANDLED;
@@ -898,15 +951,26 @@ private:
     bool _batch_process;
 };
 
+
 class GetCommandHandler : public brpc::RedisCommandHandler {
 public:
     GetCommandHandler(RedisServiceImpl* rs, bool batch_process = false)
         : _rs(rs)
         , _batch_process(batch_process) {}
 
-    brpc::RedisCommandHandlerResult Run(const std::vector<butil::StringPiece>& args,
+    brpc::RedisCommandHandlerResult Run(brpc::RedisConnContext* ctx,
+                                        const std::vector<butil::StringPiece>& args,
                                         brpc::RedisReply* output,
                                         bool flush_batched) {
+        if (!ctx->session) {
+            output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
+        AuthSession* session = static_cast<AuthSession*>(ctx->session);
+        if (session->_password != _rs->_password) {
+        	output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
         if (args.size() < 2) {
             output->SetError("ERR wrong number of arguments for 'get' command");
             return brpc::REDIS_CMD_HANDLED;
@@ -935,11 +999,22 @@ private:
 
 class IncrCommandHandler : public brpc::RedisCommandHandler {
 public:
-    IncrCommandHandler() {}
+    IncrCommandHandler(RedisServiceImpl* rs)
+        : _rs(rs) {}
 
-    brpc::RedisCommandHandlerResult Run(const std::vector<butil::StringPiece>& args,
+    brpc::RedisCommandHandlerResult Run(brpc::RedisConnContext* ctx,
+                                        const std::vector<butil::StringPiece>& args,
                                         brpc::RedisReply* output,
                                         bool flush_batched) {
+        if (!ctx->session) {
+            output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
+        AuthSession* session = static_cast<AuthSession*>(ctx->session);
+        if (session->_password != _rs->_password) {
+            output->SetError("ERR no auth");
+            return brpc::REDIS_CMD_HANDLED;
+        }
         if (args.size() < 2) {
             output->SetError("ERR wrong number of arguments for 'incr' command");
             return brpc::REDIS_CMD_HANDLED;
@@ -951,24 +1026,31 @@ public:
         output->SetInteger(value);
         return brpc::REDIS_CMD_HANDLED;
     }
+
+private:
+    RedisServiceImpl* _rs;
 };
 
 TEST_F(RedisTest, server_sanity) {
+    std::string password = GeneratePassword();
     brpc::Server server;
     brpc::ServerOptions server_options;
-    RedisServiceImpl* rsimpl = new RedisServiceImpl;
+    RedisServiceImpl* rsimpl = new RedisServiceImpl(password);
     GetCommandHandler *gh = new GetCommandHandler(rsimpl);
     SetCommandHandler *sh = new SetCommandHandler(rsimpl);
-    IncrCommandHandler *ih = new IncrCommandHandler;
+    AuthCommandHandler *ah = new AuthCommandHandler(rsimpl);
+    IncrCommandHandler *ih = new IncrCommandHandler(rsimpl);
     rsimpl->AddCommandHandler("get", gh);
     rsimpl->AddCommandHandler("set", sh);
     rsimpl->AddCommandHandler("incr", ih);
+    rsimpl->AddCommandHandler("auth", ah);
     server_options.redis_service = rsimpl;
     brpc::PortRange pr(8081, 8900);
     ASSERT_EQ(0, server.Start("127.0.0.1", pr, &server_options));
 
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_REDIS;
+    options.auth = new brpc::policy::RedisAuthenticator(password);
     brpc::Channel channel;
     ASSERT_EQ(0, channel.Init("127.0.0.1", server.listen_address().port, &options));
 
@@ -1029,7 +1111,6 @@ TEST_F(RedisTest, server_sanity) {
 
 void* incr_thread(void* arg) {
     brpc::Channel* c = static_cast<brpc::Channel*>(arg);
-
     for (int i = 0; i < 5000; ++i) {
         brpc::RedisRequest request;
         brpc::RedisResponse response;
@@ -1038,18 +1119,21 @@ void* incr_thread(void* arg) {
         c->CallMethod(NULL, &cntl, &request, &response, NULL);
         EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
         EXPECT_EQ(1, response.reply_size());
-        EXPECT_TRUE(response.reply(0).is_integer());
+        EXPECT_TRUE(response.reply(0).is_integer()) << response.reply(0);
     }
     return NULL;
 }
 
 TEST_F(RedisTest, server_concurrency) {
+    std::string password = GeneratePassword();
     int N = 10;
     brpc::Server server;
     brpc::ServerOptions server_options;
-    RedisServiceImpl* rsimpl = new RedisServiceImpl;
-    IncrCommandHandler *ih = new IncrCommandHandler;
+    RedisServiceImpl* rsimpl = new RedisServiceImpl(password);
+    AuthCommandHandler *ah = new AuthCommandHandler(rsimpl);
+    IncrCommandHandler *ih = new IncrCommandHandler(rsimpl);
     rsimpl->AddCommandHandler("incr", ih);
+    rsimpl->AddCommandHandler("auth", ah);
     server_options.redis_service = rsimpl;
     brpc::PortRange pr(8081, 8900);
     ASSERT_EQ(0, server.Start("0.0.0.0", pr, &server_options));
@@ -1057,6 +1141,7 @@ TEST_F(RedisTest, server_concurrency) {
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_REDIS;
     options.connection_type = "pooled";
+    options.auth = new brpc::policy::RedisAuthenticator(password);
     std::vector<bthread_t> bths;
     std::vector<brpc::Channel*> channels;
     for (int i = 0; i < N; ++i) {
@@ -1080,7 +1165,7 @@ public:
 
     brpc::RedisCommandHandlerResult Run(const std::vector<butil::StringPiece>& args,
                                         brpc::RedisReply* output,
-                                        bool flush_batched) {
+                                        bool flush_batched) override {
         output->SetStatus("OK");
         return brpc::REDIS_CMD_CONTINUE;
     }
@@ -1093,7 +1178,7 @@ public:
     public:
         brpc::RedisCommandHandlerResult Run(const std::vector<butil::StringPiece>& args,
                                             brpc::RedisReply* output,
-                                            bool flush_batched) {
+                                            bool flush_batched) override {
             if (args[0] == "multi") {
                 output->SetError("ERR duplicate multi");
                 return brpc::REDIS_CMD_CONTINUE;
@@ -1127,12 +1212,14 @@ public:
 };
 
 TEST_F(RedisTest, server_command_continue) {
+    std::string password = GeneratePassword();
     brpc::Server server;
     brpc::ServerOptions server_options;
-    RedisServiceImpl* rsimpl = new RedisServiceImpl;
+    RedisServiceImpl* rsimpl = new RedisServiceImpl(password);
+    rsimpl->AddCommandHandler("auth", new AuthCommandHandler(rsimpl));
     rsimpl->AddCommandHandler("get", new GetCommandHandler(rsimpl));
     rsimpl->AddCommandHandler("set", new SetCommandHandler(rsimpl));
-    rsimpl->AddCommandHandler("incr", new IncrCommandHandler);
+    rsimpl->AddCommandHandler("incr", new IncrCommandHandler(rsimpl));
     rsimpl->AddCommandHandler("multi", new MultiCommandHandler);
     server_options.redis_service = rsimpl;
     brpc::PortRange pr(8081, 8900);
@@ -1140,9 +1227,9 @@ TEST_F(RedisTest, server_command_continue) {
 
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_REDIS;
+    options.auth = new brpc::policy::RedisAuthenticator(password);
     brpc::Channel channel;
     ASSERT_EQ(0, channel.Init("127.0.0.1", server.listen_address().port, &options));
-
     {
         brpc::RedisRequest request;
         brpc::RedisResponse response;
@@ -1202,11 +1289,14 @@ TEST_F(RedisTest, server_command_continue) {
 }
 
 TEST_F(RedisTest, server_handle_pipeline) {
+    std::string password = GeneratePassword();
     brpc::Server server;
     brpc::ServerOptions server_options;
-    RedisServiceImpl* rsimpl = new RedisServiceImpl;
+    RedisServiceImpl* rsimpl = new RedisServiceImpl(password);
     GetCommandHandler* getch = new GetCommandHandler(rsimpl, true);
     SetCommandHandler* setch = new SetCommandHandler(rsimpl, true);
+    AuthCommandHandler* authch = new AuthCommandHandler(rsimpl);
+    rsimpl->AddCommandHandler("auth", authch);
     rsimpl->AddCommandHandler("get", getch);
     rsimpl->AddCommandHandler("set", setch);
     rsimpl->AddCommandHandler("multi", new MultiCommandHandler);
@@ -1216,6 +1306,7 @@ TEST_F(RedisTest, server_handle_pipeline) {
 
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_REDIS;
+    options.auth = new brpc::policy::RedisAuthenticator(password);
     brpc::Channel channel;
     ASSERT_EQ(0, channel.Init("127.0.0.1", server.listen_address().port, &options));
 

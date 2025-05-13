@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
-#include <cstdlib>
-
 #include <string>                               // std::string
 #include <iostream>
 #include <gflags/gflags.h>
@@ -35,6 +32,8 @@ namespace brpc {
 
 DEFINE_bool(allow_chunked_length, false,
             "Allow both Transfer-Encoding and Content-Length headers are present.");
+DEFINE_bool(allow_http_1_1_request_without_host, true,
+            "Allow HTTP/1.1 request without host which violates the HTTP/1.1 specification.");
 DEFINE_bool(http_verbose, false,
             "[DEBUG] Print EVERY http request/response");
 DEFINE_int32(http_verbose_max_body_length, 512,
@@ -99,10 +98,17 @@ int HttpMessage::on_header_value(http_parser *parser,
             LOG(ERROR) << "Header name is empty";
             return -1;
         }
-        http_message->_cur_value =
-            &http_message->header().GetOrAddHeader(http_message->_cur_header);
+        HttpHeader& header = http_message->header();
+        if (header.CanFoldedInLine(http_message->_cur_header)) {
+            http_message->_cur_value =
+                &header.GetOrAddHeader(http_message->_cur_header);
+        } else {
+            http_message->_cur_value =
+                &header.AddHeader(http_message->_cur_header);
+        }
         if (http_message->_cur_value && !http_message->_cur_value->empty()) {
-            http_message->_cur_value->push_back(',');
+            http_message->_cur_value->append(
+                header.HeaderValueDelimiter(http_message->_cur_header));
         }
     }
     if (http_message->_cur_value) {
@@ -135,7 +141,7 @@ int HttpMessage::on_header_value(http_parser *parser,
 }
 
 int HttpMessage::on_headers_complete(http_parser *parser) {
-    HttpMessage *http_message = (HttpMessage *)parser->data;
+    HttpMessage* http_message = (HttpMessage *)parser->data;
     http_message->_stage = HTTP_ON_HEADERS_COMPLETE;
     if (parser->http_major > 1) {
         // NOTE: this checking is a MUST because ProcessHttpResponse relies
@@ -143,35 +149,46 @@ int HttpMessage::on_headers_complete(http_parser *parser) {
         LOG(WARNING) << "Invalid major_version=" << parser->http_major;
         parser->http_major = 1;
     }
-    http_message->header().set_version(parser->http_major, parser->http_minor);
+    HttpHeader& headers = http_message->header();
+    headers.set_version(parser->http_major, parser->http_minor);
     // Only for response
     // http_parser may set status_code to 0 when the field is not needed,
     // e.g. in a request. In principle status_code is undefined in a request,
     // but to be consistent and not surprise users, we set it to OK as well.
-    http_message->header().set_status_code(
+    headers.set_status_code(
         !parser->status_code ? HTTP_STATUS_OK : parser->status_code);
     // Only for request
     // method is 0(which is DELETE) for response as well. Since users are
     // unlikely to check method of a response, we don't do anything.
-    http_message->header().set_method(static_cast<HttpMethod>(parser->method));
-    if (parser->type == HTTP_REQUEST &&
-        http_message->header().uri().SetHttpURL(http_message->_url) != 0) {
+    headers.set_method(static_cast<HttpMethod>(parser->method));
+    bool is_http_request = parser->type == HTTP_REQUEST;
+    if (is_http_request && headers.uri().SetHttpURL(http_message->_url) != 0) {
         LOG(ERROR) << "Fail to parse url=`" << http_message->_url << '\'';
         return -1;
     }
-    //rfc2616-sec5.2
+    // https://datatracker.ietf.org/doc/html/rfc2616#section-5.2
     //1. If Request-URI is an absoluteURI, the host is part of the Request-URI.
     //Any Host header field value in the request MUST be ignored.
     //2. If the Request-URI is not an absoluteURI, and the request includes a
     //Host header field, the host is determined by the Host header field value.
     //3. If the host as determined by rule 1 or 2 is not a valid host on the
-    //server, the responce MUST be a 400 error messsage.
-    URI & uri = http_message->header().uri();
+    //server, the responce MUST be a 400 (Bad Request) error messsage.
+    URI& uri = headers.uri();
     if (uri._host.empty()) {
-        const std::string* host_header = http_message->header().GetHeader("host");
+        const std::string* host_header = headers.GetHeader("host");
         if (host_header != NULL) {
             uri.SetHostAndPort(*host_header);
         }
+    }
+
+    // https://datatracker.ietf.org/doc/html/rfc2616#section-14.23
+    // All Internet-based HTTP/1.1 servers MUST respond with a 400 (Bad Request)
+    // status code to any HTTP/1.1 request message which lacks a Host header field.
+    if (uri.host().empty() && is_http_request &&
+        !headers.before_http_1_1() &&
+        !FLAGS_allow_http_1_1_request_without_host) {
+        LOG(ERROR) << "HTTP protocol error: missing host header";
+        return -1;
     }
 
     // https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.3
@@ -188,9 +205,9 @@ int HttpMessage::on_headers_complete(http_parser *parser) {
     // is chunked - remove Content-Length and serve request.
     if (parser->uses_transfer_encoding && parser->flags & F_CONTENTLENGTH) {
         if (parser->flags & F_CHUNKED && FLAGS_allow_chunked_length) {
-            http_message->header().RemoveHeader("Content-Length");
+            headers.RemoveHeader("Content-Length");
         } else {
-            LOG(ERROR) << "HTTP/1.1 protocol error: both Content-Length "
+            LOG(ERROR) << "HTTP protocol error: both Content-Length "
                        << "and Transfer-Encoding are set.";
             return -1;
         }
@@ -265,9 +282,12 @@ int HttpMessage::OnBody(const char *at, const size_t length) {
     }
     if (!_read_body_progressively) {
         // Normal read.
-        // TODO: The input data is from IOBuf as well, possible to append
-        // data w/o copying.
-        _body.append(at, length);
+        if (NULL != _current_source_iobuf) {
+            _current_source_iobuf->append_to(
+                &_body, length, _parsed_block_size + (at - _current_block_base));
+        } else {
+            _body.append(at, length);
+        }
         return 0;
     }
     // Progressive read.
@@ -417,13 +437,8 @@ const http_parser_settings g_parser_settings = {
 
 HttpMessage::HttpMessage(bool read_body_progressively,
                          HttpMethod request_method)
-    : _parsed_length(0)
-    , _stage(HTTP_ON_MESSAGE_BEGIN)
-    , _request_method(request_method)
-    , _read_body_progressively(read_body_progressively)
-    , _body_reader(NULL)
-    , _cur_value(NULL)
-    , _vbodylen(0) {
+    : _request_method(request_method)
+    , _read_body_progressively(read_body_progressively) {
     http_parser_init(&_parser, HTTP_BOTH);
     _parser.allow_chunked_length = 1;
     _parser.data = this;
@@ -472,6 +487,11 @@ ssize_t HttpMessage::ParseFromIOBuf(const butil::IOBuf &buf) {
                    << ") to already-completed message";
         return -1;
     }
+    _parsed_block_size = 0;
+    _current_source_iobuf = &buf;
+    BRPC_SCOPE_EXIT {
+        _current_source_iobuf = NULL;
+    };
     size_t nprocessed = 0;
     for (size_t i = 0; i < buf.backing_block_num(); ++i) {
         butil::StringPiece blk = buf.backing_block(i);
@@ -479,8 +499,11 @@ ssize_t HttpMessage::ParseFromIOBuf(const butil::IOBuf &buf) {
             // length=0 will be treated as EOF by http_parser, must skip.
             continue;
         }
-        nprocessed += http_parser_execute(
+        _current_block_base = blk.data();
+        size_t n = http_parser_execute(
             &_parser, &g_parser_settings, blk.data(), blk.size());
+        nprocessed += n;
+        _parsed_block_size += n;
         if (_parser.http_errno != 0) {
             // May try HTTP on other formats, failure is norm.
             RPC_VLOG << "Fail to parse http message, parser=" << _parser

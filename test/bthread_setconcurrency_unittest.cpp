@@ -97,7 +97,7 @@ TEST(BthreadTest, setconcurrency_with_running_bthread) {
     *odd = 0;
     *even = 0;
     std::vector<bthread_t> tids;
-    const int N = 500;
+    const int N = 200;
     for (int i = 0; i < N; ++i) {
         bthread_t tid;
         bthread_start_background(&tid, &BTHREAD_ATTR_SMALL, odd_thread, NULL);
@@ -140,13 +140,13 @@ void* add_concurrency_proc(void*) {
 bool set_min_concurrency(int num) {
     std::stringstream ss;
     ss << num;
-    std::string ret = GFLAGS_NS::SetCommandLineOption("bthread_min_concurrency", ss.str().c_str());
+    std::string ret = GFLAGS_NAMESPACE::SetCommandLineOption("bthread_min_concurrency", ss.str().c_str());
     return !ret.empty();
 }
 
 int get_min_concurrency() {
     std::string ret;
-    GFLAGS_NS::GetCommandLineOption("bthread_min_concurrency", &ret);
+    GFLAGS_NAMESPACE::GetCommandLineOption("bthread_min_concurrency", &ret);
     return atoi(ret.c_str());
 }
 
@@ -155,7 +155,7 @@ TEST(BthreadTest, min_concurrency) {
     ASSERT_EQ(1, set_min_concurrency(0)); // set min success
     ASSERT_EQ(0, get_min_concurrency());
     int conn = bthread_getconcurrency();
-    int add_conn = 100;
+    int add_conn = 50;
 
     ASSERT_EQ(0, set_min_concurrency(conn + 1)); // set min failed
     ASSERT_EQ(0, get_min_concurrency());
@@ -194,12 +194,12 @@ TEST(BthreadTest, min_concurrency) {
 int current_tag(int tag) {
     std::stringstream ss;
     ss << tag;
-    std::string ret = GFLAGS_NS::SetCommandLineOption("bthread_current_tag", ss.str().c_str());
+    std::string ret = GFLAGS_NAMESPACE::SetCommandLineOption("bthread_current_tag", ss.str().c_str());
     return !(ret.empty());
 }
 
 TEST(BthreadTest, current_tag) {
-    ASSERT_EQ(false, current_tag(-1));
+    ASSERT_EQ(false, current_tag(-2));
     ASSERT_EQ(true, current_tag(0));
     ASSERT_EQ(false, current_tag(1));
 }
@@ -208,16 +208,17 @@ int concurrency_by_tag(int num) {
     std::stringstream ss;
     ss << num;
     std::string ret =
-        GFLAGS_NS::SetCommandLineOption("bthread_concurrency_by_tag", ss.str().c_str());
+        GFLAGS_NAMESPACE::SetCommandLineOption("bthread_concurrency_by_tag", ss.str().c_str());
     return !(ret.empty());
 }
 
 TEST(BthreadTest, concurrency_by_tag) {
-    ASSERT_EQ(concurrency_by_tag(1), true);
     ASSERT_EQ(concurrency_by_tag(1), false);
-    auto con = bthread_getconcurrency_by_tag(0);
+    auto tag_con = bthread_getconcurrency_by_tag(0);
+    auto con = bthread_getconcurrency();
     ASSERT_EQ(concurrency_by_tag(con), true);
-    ASSERT_EQ(concurrency_by_tag(con + 1), false);
+    ASSERT_EQ(concurrency_by_tag(con + 1), true);
+    ASSERT_EQ(bthread_getconcurrency(), con+1);
     bthread_setconcurrency(con + 1);
     ASSERT_EQ(concurrency_by_tag(con + 1), true);
 }

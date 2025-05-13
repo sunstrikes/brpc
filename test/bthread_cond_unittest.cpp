@@ -21,7 +21,7 @@
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/scoped_lock.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "bthread/bthread.h"
 #include "bthread/condition_variable.h"
 #include "bthread/stack.h"
@@ -397,6 +397,7 @@ private:
     bthread_mutex_t _mutex;
 };
 
+#ifndef BUTIL_USE_ASAN
 volatile bool g_stop = false;
 bool started_wait = false;
 bool ended_wait = false;
@@ -445,6 +446,7 @@ static void launch_many_bthreads() {
 }
 
 TEST(CondTest, too_many_bthreads_from_pthread) {
+    bthread_setconcurrency(16);
     launch_many_bthreads();
 }
 
@@ -454,8 +456,10 @@ static void* run_launch_many_bthreads(void*) {
 }
 
 TEST(CondTest, too_many_bthreads_from_bthread) {
+    bthread_setconcurrency(16);
     bthread_t th;
     ASSERT_EQ(0, bthread_start_urgent(&th, NULL, run_launch_many_bthreads, NULL));
     bthread_join(th, NULL);
 }
+#endif // BUTIL_USE_ASAN
 } // namespace

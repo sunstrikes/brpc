@@ -19,27 +19,26 @@
 #include <google/protobuf/descriptor.h>             // MethodDescriptor
 #include <google/protobuf/text_format.h>
 #include <gflags/gflags.h>
-#include <json2pb/pb_to_json.h>                    // ProtoMessageToJson
-#include <json2pb/json_to_pb.h>                    // JsonToProtoMessage
 #include <string>
-
 #include "brpc/policy/http_rpc_protocol.h"
 #include "butil/unique_ptr.h"                       // std::unique_ptr
 #include "butil/string_splitter.h"                  // StringMultiSplitter
 #include "butil/string_printf.h"
 #include "butil/time.h"
 #include "butil/sys_byteorder.h"
+#include "json2pb/pb_to_json.h"                     // ProtoMessageToJson
+#include "json2pb/json_to_pb.h"                     // JsonToProtoMessage
 #include "brpc/compress.h"
-#include "brpc/errno.pb.h"                     // ENOSERVICE, ENOMETHOD
-#include "brpc/controller.h"                   // Controller
-#include "brpc/server.h"                       // Server
+#include "brpc/errno.pb.h"                          // ENOSERVICE, ENOMETHOD
+#include "brpc/controller.h"                        // Controller
+#include "brpc/server.h"                            // Server
 #include "brpc/details/server_private_accessor.h"
 #include "brpc/span.h"
-#include "brpc/socket.h"                       // Socket
-#include "brpc/rpc_dump.h"                     // SampledRequest
-#include "brpc/http_status_code.h"             // HTTP_STATUS_*
+#include "brpc/socket.h"                            // Socket
+#include "brpc/rpc_dump.h"                          // SampledRequest
+#include "brpc/http_status_code.h"                  // HTTP_STATUS_*
 #include "brpc/details/controller_private_accessor.h"
-#include "brpc/builtin/index_service.h"        // IndexService
+#include "brpc/builtin/index_service.h"             // IndexService
 #include "brpc/policy/gzip_compress.h"
 #include "brpc/policy/http2_rpc_protocol.h"
 #include "brpc/details/usercode_backup_pool.h"
@@ -203,6 +202,9 @@ HttpContentType ParseContentType(butil::StringPiece ct, bool* is_grpc_ct) {
     if (ct.starts_with("json")) {
         type = HTTP_CONTENT_JSON;
         ct.remove_prefix(4);
+    } else if (ct.starts_with("proto-json")) {
+        type = HTTP_CONTENT_PROTO_JSON;
+        ct.remove_prefix(10);
     } else if (ct.starts_with("proto-text")) {
         type = HTTP_CONTENT_PROTO_TEXT;
         ct.remove_prefix(10);
@@ -269,6 +271,75 @@ static bool RemoveGrpcPrefix(butil::IOBuf* body, bool* compressed) {
     *compressed = buf[0];
     const size_t message_length = butil::NetToHost32(*(uint32_t*)(buf + 1));
     return (message_length + 5 == sz);
+}
+
+static bool JsonToProtoMessage(const butil::IOBuf& body,
+                               google::protobuf::Message* message,
+                               Controller* cntl, int error_code) {
+    butil::IOBufAsZeroCopyInputStream wrapper(body);
+    json2pb::Json2PbOptions options;
+    options.base64_to_bytes = cntl->has_pb_bytes_to_base64();
+    options.array_to_single_repeated = cntl->has_pb_single_repeated_to_array();
+    std::string error;
+    bool ok = json2pb::JsonToProtoMessage(&wrapper, message, options, &error);
+    if (!ok) {
+        cntl->SetFailed(error_code, "Fail to parse http json body as %s: %s",
+                        message->GetDescriptor()->full_name().c_str(),
+                        error.c_str());
+    }
+    return ok;
+}
+
+static bool ProtoMessageToJson(const google::protobuf::Message& message,
+                               butil::IOBufAsZeroCopyOutputStream* wrapper,
+                               Controller* cntl, int error_code) {
+    json2pb::Pb2JsonOptions options;
+    options.bytes_to_base64 = cntl->has_pb_bytes_to_base64();
+    options.jsonify_empty_array = cntl->has_pb_jsonify_empty_array();
+    options.always_print_primitive_fields = cntl->has_always_print_primitive_fields();
+    options.single_repeated_to_array = cntl->has_pb_single_repeated_to_array();
+    options.enum_option = FLAGS_pb_enum_as_number
+                          ? json2pb::OUTPUT_ENUM_BY_NUMBER
+                          : json2pb::OUTPUT_ENUM_BY_NAME;
+    std::string error;
+    bool ok = json2pb::ProtoMessageToJson(message, wrapper, options, &error);
+    if (!ok) {
+        cntl->SetFailed(error_code, "Fail to convert %s to json: %s",
+                        message.GetDescriptor()->full_name().c_str(),
+                        error.c_str());
+    }
+    return ok;
+}
+
+static bool ProtoJsonToProtoMessage(const butil::IOBuf& body,
+                                    google::protobuf::Message* message,
+                                    Controller* cntl, int error_code) {
+    json2pb::ProtoJson2PbOptions options;
+    options.ignore_unknown_fields = true;
+    butil::IOBufAsZeroCopyInputStream wrapper(body);
+    std::string error;
+    bool ok = json2pb::ProtoJsonToProtoMessage(&wrapper, message, options, &error);
+    if (!ok) {
+        cntl->SetFailed(error_code, "Fail to parse http proto-json body as %s: %s",
+                        message->GetDescriptor()->full_name().c_str(),
+                        error.c_str());
+    }
+    return ok;
+}
+
+static bool ProtoMessageToProtoJson(const google::protobuf::Message& message,
+                                    butil::IOBufAsZeroCopyOutputStream* wrapper,
+                                    Controller* cntl, int error_code) {
+    json2pb::Pb2ProtoJsonOptions options;
+    AlwaysPrintPrimitiveFields(options) = cntl->has_always_print_primitive_fields();
+    options.always_print_enums_as_ints = FLAGS_pb_enum_as_number;
+    std::string error;
+    bool ok = json2pb::ProtoMessageToProtoJson(message, wrapper, options, &error);
+    if (!ok) {
+        cntl->SetFailed(error_code, "Fail to convert %s to proto-json: %s",
+                        message.GetDescriptor()->full_name().c_str(), error.c_str());
+    }
+    return ok;
 }
 
 void ProcessHttpResponse(InputMessageBase* msg) {
@@ -435,8 +506,8 @@ void ProcessHttpResponse(InputMessageBase* msg) {
             if (grpc_compressed) {
                 encoding = res_header->GetHeader(common->GRPC_ENCODING);
                 if (encoding == NULL) {
-                    cntl->SetFailed(ERESPONSE, "Fail to find header `grpc-encoding'"
-                                    " in compressed gRPC response");
+                    cntl->SetFailed(ERESPONSE, "Fail to find header `grpc-encoding' "
+                                               "in compressed gRPC response");
                     break;
                 }
             }
@@ -455,23 +526,24 @@ void ProcessHttpResponse(InputMessageBase* msg) {
         }
         if (content_type == HTTP_CONTENT_PROTO) {
             if (!ParsePbFromIOBuf(cntl->response(), res_body)) {
-                cntl->SetFailed(ERESPONSE, "Fail to parse content");
+                cntl->SetFailed(ERESPONSE, "Fail to parse content as %s",
+                                cntl->response()->GetDescriptor()->full_name().c_str());
                 break;
             }
         } else if (content_type == HTTP_CONTENT_PROTO_TEXT) {
             if (!ParsePbTextFromIOBuf(cntl->response(), res_body)) {
-                cntl->SetFailed(ERESPONSE, "Fail to parse proto-text content");
+                cntl->SetFailed(ERESPONSE, "Fail to parse proto-text content as %s",
+                                cntl->response()->GetDescriptor()->full_name().c_str());
                 break;
             }
         } else if (content_type == HTTP_CONTENT_JSON) {
-            // message body is json
-            butil::IOBufAsZeroCopyInputStream wrapper(res_body);
-            std::string err;
-            json2pb::Json2PbOptions options;
-            options.base64_to_bytes = cntl->has_pb_bytes_to_base64();
-            options.array_to_single_repeated = cntl->has_pb_single_repeated_to_array();
-            if (!json2pb::JsonToProtoMessage(&wrapper, cntl->response(), options, &err)) {
-                cntl->SetFailed(ERESPONSE, "Fail to parse content, %s", err.c_str());
+            // Message body is json.
+            if (!JsonToProtoMessage(res_body, cntl->response(), cntl, ERESPONSE)) {
+                break;
+            }
+        } else if (content_type == HTTP_CONTENT_PROTO_JSON) {
+            // Message body is json.
+            if (!ProtoJsonToProtoMessage(res_body, cntl->response(), cntl, ERESPONSE)) {
                 break;
             }
         } else {
@@ -530,8 +602,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
             }
         } else {
             bool is_grpc_ct = false;
-            content_type = ParseContentType(hreq.content_type(),
-                                            &is_grpc_ct);
+            content_type = ParseContentType(hreq.content_type(), &is_grpc_ct);
             is_grpc = (is_http2 && is_grpc_ct);
         }
 
@@ -549,21 +620,15 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
                 return cntl->SetFailed(EREQUEST, "Fail to print %s as proto-text",
                                        pbreq->GetTypeName().c_str());
             }
-        } else if (content_type == HTTP_CONTENT_JSON) {
-            std::string err;
-            json2pb::Pb2JsonOptions opt;
-            opt.bytes_to_base64 = cntl->has_pb_bytes_to_base64();
-            opt.jsonify_empty_array = cntl->has_pb_jsonify_empty_array();
-            opt.always_print_primitive_fields = cntl->has_always_print_primitive_fields();
-            opt.single_repeated_to_array = cntl->has_pb_single_repeated_to_array();
-
-            opt.enum_option = (FLAGS_pb_enum_as_number
-                               ? json2pb::OUTPUT_ENUM_BY_NUMBER
-                               : json2pb::OUTPUT_ENUM_BY_NAME);
-            if (!json2pb::ProtoMessageToJson(*pbreq, &wrapper, opt, &err)) {
+        } else if (content_type == HTTP_CONTENT_PROTO_JSON) {
+            if (!ProtoMessageToProtoJson(*pbreq, &wrapper, cntl, EREQUEST)) {
                 cntl->request_attachment().clear();
-                return cntl->SetFailed(
-                    EREQUEST, "Fail to convert request to json, %s", err.c_str());
+                return;
+            }
+        } else if (content_type == HTTP_CONTENT_JSON) {
+            if (!ProtoMessageToJson(*pbreq, &wrapper, cntl, EREQUEST)) {
+                cntl->request_attachment().clear();
+                return;
             }
         } else {
             return cntl->SetFailed(
@@ -710,30 +775,33 @@ public:
     HttpResponseSender()
         : HttpResponseSender(NULL) {}
     explicit HttpResponseSender(Controller* cntl/*own*/)
-        : _cntl(cntl), _method_status(NULL), _received_us(0), _h2_stream_id(-1) {}
+        : _cntl(cntl)
+        , _messages(NULL)
+        , _method_status(NULL)
+        , _received_us(0)
+        , _h2_stream_id(-1) {}
+
     HttpResponseSender(HttpResponseSender&& s) noexcept
         : _cntl(std::move(s._cntl))
-        , _req(std::move(s._req))
-        , _res(std::move(s._res))
+        , _messages(s._messages)
         , _method_status(s._method_status)
         , _received_us(s._received_us)
         , _h2_stream_id(s._h2_stream_id) {
+        s._messages = NULL;
         s._method_status = NULL;
         s._received_us = 0;
         s._h2_stream_id = -1;
     }
     ~HttpResponseSender();
 
-    void own_request(google::protobuf::Message* req) { _req.reset(req); }
-    void own_response(google::protobuf::Message* res) { _res.reset(res); }
+    void set_messages(RpcPBMessages* messages) { _messages = messages; }
     void set_method_status(MethodStatus* ms) { _method_status = ms; }
     void set_received_us(int64_t t) { _received_us = t; }
     void set_h2_stream_id(int id) { _h2_stream_id = id; }
 
 private:
     std::unique_ptr<Controller, LogErrorTextAndDelete> _cntl;
-    std::unique_ptr<google::protobuf::Message> _req;
-    std::unique_ptr<google::protobuf::Message> _res;
+    RpcPBMessages* _messages;
     MethodStatus* _method_status;
     int64_t _received_us;
     int _h2_stream_id;
@@ -743,7 +811,10 @@ class HttpResponseSenderAsDone : public google::protobuf::Closure {
 public:
     explicit HttpResponseSenderAsDone(HttpResponseSender* s) : _sender(std::move(*s)) {}
     void Run() override {
-        _sender._cntl->CallAfterRpcResp(_sender._req.get(), _sender._res.get());
+        if (NULL != _sender._messages) {
+            _sender._cntl->CallAfterRpcResp(_sender._messages->Request(),
+                                            _sender._messages->Response());
+        }
         delete this;
     }
 
@@ -752,6 +823,12 @@ private:
 };
 
 HttpResponseSender::~HttpResponseSender() {
+    // Return messages to factory at the end.
+    BRPC_SCOPE_EXIT {
+        if (NULL != _messages) {
+            _cntl->server()->options().rpc_pb_message_factory->Return(_messages);
+        }
+    };
     Controller* cntl = _cntl.get();
     if (cntl == NULL) {
         return;
@@ -763,7 +840,7 @@ HttpResponseSender::~HttpResponseSender() {
     }
     ConcurrencyRemover concurrency_remover(_method_status, cntl, _received_us);
     Socket* socket = accessor.get_sending_socket();
-    const google::protobuf::Message* res = _res.get();
+    const google::protobuf::Message* res = NULL != _messages ? _messages->Response() : NULL;
     
     if (cntl->IsCloseConnection()) {
         socket->SetFailed();
@@ -809,19 +886,10 @@ HttpResponseSender::~HttpResponseSender() {
             if (!google::protobuf::TextFormat::Print(*res, &wrapper)) {
                 cntl->SetFailed(ERESPONSE, "Fail to print %s as proto-text", res->GetTypeName().c_str());
             }
+        } else if (content_type == HTTP_CONTENT_PROTO_JSON) {
+            ProtoMessageToProtoJson(*res, &wrapper, cntl, ERESPONSE);
         } else {
-            std::string err;
-            json2pb::Pb2JsonOptions opt;
-            opt.bytes_to_base64 = cntl->has_pb_bytes_to_base64();
-            opt.jsonify_empty_array = cntl->has_pb_jsonify_empty_array();
-            opt.always_print_primitive_fields = cntl->has_always_print_primitive_fields();
-            opt.single_repeated_to_array = cntl->has_pb_single_repeated_to_array();
-            opt.enum_option = (FLAGS_pb_enum_as_number
-                               ? json2pb::OUTPUT_ENUM_BY_NUMBER
-                               : json2pb::OUTPUT_ENUM_BY_NAME);
-            if (!json2pb::ProtoMessageToJson(*res, &wrapper, opt, &err)) {
-                cntl->SetFailed(ERESPONSE, "Fail to convert response to json, %s", err.c_str());
-            }
+            ProtoMessageToJson(*res, &wrapper, cntl, ERESPONSE);
         }
     }
 
@@ -924,8 +992,15 @@ HttpResponseSender::~HttpResponseSender() {
     int rc = -1;
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (is_http2) {
         if (is_grpc) {
             // Append compressed and length before body
@@ -970,9 +1045,12 @@ HttpResponseSender::~HttpResponseSender() {
         cntl->SetFailed(errcode, "Fail to write into %s", socket->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -1253,6 +1331,26 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
     }
 }
 
+static void SendUnauthorizedResponse(const std::string& user_error_text, Socket* socket) {
+    // Send 403(forbidden) to client.
+    HttpHeader header;
+    header.set_status_code(HTTP_STATUS_FORBIDDEN);
+    butil::IOBuf content;
+    content.append(butil::string_printf("[%d]", ERPCAUTH));
+    content.append("Fail to authenticate");
+    if (!user_error_text.empty()) {
+        content.append(": ");
+        content.append(user_error_text);
+    }
+    butil::IOBuf res_buf;
+    MakeRawHttpResponse(&res_buf, &header, &content);
+    Socket::WriteOptions opt;
+    opt.ignore_eovercrowded = true;
+    if (socket->Write(&res_buf, &opt) != 0) {
+        PLOG_IF(WARNING, errno != EPIPE) << "Fail to write into " << *socket;
+    }
+}
+
 bool VerifyHttpRequest(const InputMessageBase* msg) {
     Server* server = (Server*)msg->arg();
     Socket* socket = msg->socket();
@@ -1265,8 +1363,7 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
     }
     const Server::MethodProperty* mp = FindMethodPropertyByURI(
         http_request->header().uri().path(), server, NULL);
-    if (mp != NULL &&
-        mp->is_builtin_service &&
+    if (mp != NULL && mp->is_builtin_service &&
         mp->service->GetDescriptor() != BadMethodService::descriptor()) {
         // BuiltinService doesn't need authentication
         // TODO: Fix backdoor that sends BuiltinService at first
@@ -1275,16 +1372,22 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
     }
 
     const std::string *authorization 
-        = http_request->header().GetHeader("Authorization");
+        = http_request->header().GetHeader(common->AUTHORIZATION);
     if (authorization == NULL) {
+        SendUnauthorizedResponse(auth->GetUnauthorizedErrorText(), socket);
         return false;
     }
     butil::EndPoint user_addr;
     if (!GetUserAddressFromHeader(http_request->header(), &user_addr)) {
         user_addr = socket->remote_side();
     }
-    return auth->VerifyCredential(*authorization, user_addr,
-                                  socket->mutable_auth_context()) == 0;
+    if (auth->VerifyCredential(*authorization, user_addr,
+                               socket->mutable_auth_context()) != 0) {
+        SendUnauthorizedResponse(auth->GetUnauthorizedErrorText(), socket);
+        return false;
+    }
+
+    return true;
 }
 
 
@@ -1422,9 +1525,9 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         return svc->CallMethod(md, cntl, NULL, NULL, done);
     }
     
-    const Server::MethodProperty* const sp =
+    const Server::MethodProperty* const mp =
         FindMethodPropertyByURI(path, server, &req_header._unresolved_path);
-    if (NULL == sp) {
+    if (NULL == mp) {
         if (security_mode) {
             std::string escape_path;
             WebEscape(path, &escape_path);
@@ -1433,34 +1536,36 @@ void ProcessHttpRequest(InputMessageBase *msg) {
             cntl->SetFailed(ENOMETHOD, "Fail to find method on `%s'", path.c_str());
         }
         return;
-    } else if (sp->service->GetDescriptor() == BadMethodService::descriptor()) {
+    } else if (mp->service->GetDescriptor() == BadMethodService::descriptor()) {
         BadMethodRequest breq;
         BadMethodResponse bres;
         butil::StringSplitter split(path.c_str(), '/');
         breq.set_service_name(std::string(split.field(), split.length()));
-        sp->service->CallMethod(sp->method, cntl, &breq, &bres, NULL);
+        mp->service->CallMethod(mp->method, cntl, &breq, &bres, NULL);
         return;
     }
     // Switch to service-specific error.
     non_service_error.release();
-    MethodStatus* method_status = sp->status;
+    MethodStatus* method_status = mp->status;
     resp_sender.set_method_status(method_status);
     if (method_status) {
         int rejected_cc = 0;
         if (!method_status->OnRequested(&rejected_cc)) {
             cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
-                            sp->method->full_name().c_str(), rejected_cc);
+                            mp->method->full_name().c_str(), rejected_cc);
             return;
         }
     }
     
     if (span) {
-        span->ResetServerSpanName(sp->method->full_name());
+        span->ResetServerSpanName(mp->method->full_name());
     }
     // NOTE: accesses to builtin services are not counted as part of
     // concurrency, therefore are not limited by ServerOptions.max_concurrency.
-    if (!sp->is_builtin_service && !sp->params.is_tabbed) {
-        if (socket->is_overcrowded()) {
+    if (!mp->is_builtin_service && !mp->params.is_tabbed) {
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !mp->ignore_eovercrowded) {
             cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
                             butil::endpoint2str(socket->remote_side()).c_str());
             return;
@@ -1485,20 +1590,20 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         return;
     }
 
-    google::protobuf::Service* svc = sp->service;
-    const google::protobuf::MethodDescriptor* method = sp->method;
+    google::protobuf::Service* svc = mp->service;
+    const google::protobuf::MethodDescriptor* method = mp->method;
     accessor.set_method(method);
-    google::protobuf::Message* req = svc->GetRequestPrototype(method).New();
-    resp_sender.own_request(req);
-    google::protobuf::Message* res = svc->GetResponsePrototype(method).New();
-    resp_sender.own_response(res);
+    RpcPBMessages* messages = server->options().rpc_pb_message_factory->Get(*svc, *method);;
+    resp_sender.set_messages(messages);
+    google::protobuf::Message* req = messages->Request();
+    google::protobuf::Message* res = messages->Response();
 
     if (__builtin_expect(!req || !res, 0)) {
         PLOG(FATAL) << "Fail to new req or res";
         cntl->SetFailed("Fail to new req or res");
         return;
     }
-    if (sp->params.allow_http_body_to_pb &&
+    if (mp->params.allow_http_body_to_pb &&
         method->input_type()->field_count() > 0) {
         // A protobuf service. No matter if Content-type is set to
         // applcation/json or body is empty, we have to treat body as a json
@@ -1563,30 +1668,29 @@ void ProcessHttpRequest(InputMessageBase *msg) {
                                     req->GetDescriptor()->full_name().c_str());
                     return;
                 }
+            } else if (content_type == HTTP_CONTENT_PROTO_JSON) {
+                if (!ProtoJsonToProtoMessage(req_body, req, cntl, EREQUEST)) {
+                    return;
+                }
             } else {
-                butil::IOBufAsZeroCopyInputStream wrapper(req_body);
-                std::string err;
-                json2pb::Json2PbOptions options;
-                options.base64_to_bytes = sp->params.pb_bytes_to_base64;
-                options.array_to_single_repeated = sp->params.pb_single_repeated_to_array;
-                cntl->set_pb_bytes_to_base64(sp->params.pb_bytes_to_base64);
-                cntl->set_pb_single_repeated_to_array(sp->params.pb_single_repeated_to_array);
-                if (!json2pb::JsonToProtoMessage(&wrapper, req, options, &err)) {
-                    cntl->SetFailed(EREQUEST, "Fail to parse http body as %s, %s",
-                                    req->GetDescriptor()->full_name().c_str(), err.c_str());
+                cntl->set_pb_bytes_to_base64(mp->params.pb_bytes_to_base64);
+                cntl->set_pb_single_repeated_to_array(mp->params.pb_single_repeated_to_array);
+                if (!JsonToProtoMessage(req_body, req, cntl, EREQUEST)) {
                     return;
                 }
             }
         }
-        SampledRequest* sample = AskToBeSampled();
-        if (sample && !is_http2) {
-            sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
-            sample->meta.set_protocol_type(PROTOCOL_HTTP);
-            sample->meta.set_attachment_size(req_body.size());
+        if (!is_http2) {
+            SampledRequest* sample = AskToBeSampled();
+            if (sample) {
+                sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
+                sample->meta.set_protocol_type(PROTOCOL_HTTP);
+                sample->meta.set_attachment_size(req_body.size());
 
-            butil::EndPoint ep;
-            MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
-            sample->submit(start_parse_us);
+                butil::EndPoint ep;
+                MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
+                sample->submit(start_parse_us);
+            }
         }
     } else {
         if (imsg_guard->read_body_progressively()) {
@@ -1659,7 +1763,7 @@ void HttpContext::CheckProgressiveRead(const void* arg, Socket *socket) {
         header().uri().path(), (Server *)arg,
         const_cast<std::string *>(&header().unresolved_path()));
     if (sp != NULL && sp->params.enable_progressive_read) {
-        this->set_read_body_progressively(true);
+        set_read_body_progressively(true);
         socket->read_will_be_progressive(CONNECTION_TYPE_SHORT);
     }
 }

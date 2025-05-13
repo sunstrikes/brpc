@@ -22,14 +22,16 @@
 #ifndef BUTIL_OBJECT_POOL_INL_H
 #define BUTIL_OBJECT_POOL_INL_H
 
-#include <iostream>                      // std::ostream
-#include <pthread.h>                     // pthread_mutex_t
-#include <algorithm>                     // std::max, std::min
+#include <iostream>                       // std::ostream
+#include <pthread.h>                      // pthread_mutex_t
+#include <algorithm>                      // std::max, std::min
+#include <vector>
 #include "butil/atomicops.h"              // butil::atomic
 #include "butil/macros.h"                 // BAIDU_CACHELINE_ALIGNMENT
 #include "butil/scoped_lock.h"            // BAIDU_SCOPED_LOCK
 #include "butil/thread_local.h"           // BAIDU_THREAD_LOCAL
-#include <vector>
+#include "butil/memory/aligned_memory.h"  // butil::AlignedMemory
+#include "butil/debug/address_annotations.h"
 
 #ifdef BUTIL_OBJECT_POOL_NEED_FREE_ITEM_NUM
 #define BAIDU_OBJECT_POOL_FREE_ITEM_NUM_ADD1                    \
@@ -53,7 +55,7 @@ template <typename T>
 struct ObjectPoolFreeChunk<T, 0> {
     size_t nfree;
     T* ptrs[0];
-}; 
+};
 
 struct ObjectPoolInfo {
     size_t local_pool_num;
@@ -84,6 +86,29 @@ public:
 
 template <typename T>
 class BAIDU_CACHELINE_ALIGNMENT ObjectPool {
+private:
+#ifdef BUTIL_USE_ASAN
+    static void asan_poison_memory_region(T* ptr) {
+        if (!ObjectPoolWithASanPoison<T>::value || NULL == ptr) {
+            return;
+        }
+        // Marks the object as addressable.
+        BUTIL_ASAN_POISON_MEMORY_REGION(ptr, sizeof(T));
+    }
+    static void asan_unpoison_memory_region(T* ptr) {
+        if (!ObjectPoolWithASanPoison<T>::value || NULL == ptr) {
+            return;
+        }
+        // Marks the object as unaddressable.
+        BUTIL_ASAN_UNPOISON_MEMORY_REGION(ptr, sizeof(T));
+    }
+#define OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr) asan_poison_memory_region(ptr)
+#define OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr) asan_unpoison_memory_region(ptr)
+#else
+#define OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr) ((void)(ptr))
+#define OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr) ((void)(ptr))
+#endif // BUTIL_USE_ASAN
+
 public:
     static const size_t BLOCK_NITEM = ObjectPoolBlockItemNum<T>::value;
     static const size_t FREE_CHUNK_NITEM = BLOCK_NITEM;
@@ -92,12 +117,20 @@ public:
     // global list(_free_chunks).
     typedef ObjectPoolFreeChunk<T, FREE_CHUNK_NITEM>    FreeChunk;
     typedef ObjectPoolFreeChunk<T, 0> DynamicFreeChunk;
+#ifdef BUTIL_USE_ASAN
+    // According to https://github.com/google/sanitizers/wiki/AddressSanitizerManualPoisoning ,
+    // The allocated chunks should start with 8-aligned addresses,
+    // so that AlignedMemory starts with at least 8-aligned addresses.
+    typedef AlignedMemory<sizeof(T), __alignof__(T) < 8 ? 8 : __alignof__(T)> BlockItem;
+#else
+    typedef AlignedMemory<sizeof(T), __alignof__(T)> BlockItem;
+#endif
 
     // When a thread needs memory, it allocates a Block. To improve locality,
     // items in the Block are only used by the thread.
     // To support cache-aligned objects, align Block.items by cacheline.
     struct BAIDU_CACHELINE_ALIGNMENT Block {
-        char items[sizeof(T) * BLOCK_NITEM];
+        BlockItem items[BLOCK_NITEM];
         size_t nitem;
 
         Block() : nitem(0) {}
@@ -158,24 +191,31 @@ public:
             BAIDU_OBJECT_POOL_FREE_ITEM_NUM_SUB1;                       \
             return _cur_free.ptrs[--_cur_free.nfree];                   \
         }                                                               \
+        T* obj = NULL;                                                  \
         /* Fetch memory from local block */                             \
         if (_cur_block && _cur_block->nitem < BLOCK_NITEM) {            \
-            T* obj = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
                 return NULL;                                            \
             }                                                           \
+            /* It's poisoned prior to use. */                           \
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(obj);                 \
             ++_cur_block->nitem;                                        \
             return obj;                                                 \
         }                                                               \
         /* Fetch a Block from global */                                 \
         _cur_block = add_block(&_cur_block_index);                      \
         if (_cur_block != NULL) {                                       \
-            T* obj = new ((T*)_cur_block->items + _cur_block->nitem) T CTOR_ARGS; \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
                 return NULL;                                            \
             }                                                           \
+            /* It's poisoned prior to use. */                           \
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(obj);                 \
             ++_cur_block->nitem;                                        \
             return obj;                                                 \
         }                                                               \
@@ -186,19 +226,17 @@ public:
             BAIDU_OBJECT_POOL_GET();
         }
 
-        template <typename A1>
-        inline T* get(const A1& a1) {
-            BAIDU_OBJECT_POOL_GET((a1));
-        }
-
-        template <typename A1, typename A2>
-        inline T* get(const A1& a1, const A2& a2) {
-            BAIDU_OBJECT_POOL_GET((a1, a2));
+        template<typename... Args>
+        inline T* get(Args&&... args) {
+            BAIDU_OBJECT_POOL_GET((std::forward<Args>(args)...));
         }
 
 #undef BAIDU_OBJECT_POOL_GET
 
         inline int return_object(T* ptr) {
+            // TODO. Refer to ASan to implement a efficient quarantine mechanism.
+            OBJECT_POOL_ASAN_POISON_MEMORY_REGION(ptr);
+
             // Return to local free list
             if (_cur_free.nfree < ObjectPool::free_chunk_nitem()) {
                 _cur_free.ptrs[_cur_free.nfree++] = ptr;
@@ -216,6 +254,10 @@ public:
             return -1;
         }
 
+        inline bool free_empty() const {
+            return 0 == _cur_free.nfree;
+        }
+
     private:
         ObjectPool* _pool;
         Block* _cur_block;
@@ -223,30 +265,23 @@ public:
         FreeChunk _cur_free;
     };
 
-    inline T* get_object() {
+    inline bool local_free_empty() {
         LocalPool* lp = get_or_new_local_pool();
         if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get();
+            return lp->free_empty();
         }
-        return NULL;
+        return true;
     }
 
-    template <typename A1>
-    inline T* get_object(const A1& arg1) {
+    template <typename... Args>
+    inline T* get_object(Args&&... args) {
         LocalPool* lp = get_or_new_local_pool();
+        T* ptr = NULL;
         if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get(arg1);
+            ptr = lp->get(std::forward<Args>(args)...);
+            OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(ptr);
         }
-        return NULL;
-    }
-
-    template <typename A1, typename A2>
-    inline T* get_object(const A1& arg1, const A2& arg2) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get(arg1, arg2);
-        }
-        return NULL;
+        return ptr;
     }
 
     inline int return_object(T* ptr) {
@@ -437,8 +472,10 @@ private:
                     continue;
                 }
                 for (size_t k = 0; k < b->nitem; ++k) {
-                    T* const objs = (T*)b->items;
-                    objs[k].~T();
+                    T* obj = (T*)&b->items[k];
+                    // Unpoison to avoid affecting other allocator.
+                    OBJECT_POOL_ASAN_UNPOISON_MEMORY_REGION(obj);
+                    obj->~T();
                 }
                 delete b;
             }

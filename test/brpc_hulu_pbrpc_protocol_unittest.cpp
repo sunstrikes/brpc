@@ -27,7 +27,6 @@
 #include <google/protobuf/descriptor.h>
 #include "butil/time.h"
 #include "butil/macros.h"
-#include "butil/gperftools_profiler.h"
 #include "brpc/socket.h"
 #include "brpc/acceptor.h"
 #include "brpc/server.h"
@@ -39,7 +38,7 @@
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }
 

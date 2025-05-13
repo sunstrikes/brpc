@@ -19,6 +19,7 @@
 #ifndef  BRPC_STREAM_IMPL_H
 #define  BRPC_STREAM_IMPL_H
 
+#include <mutex>
 #include "bthread/bthread.h"
 #include "bthread/execution_queue.h"
 #include "brpc/socket.h"
@@ -46,7 +47,7 @@ public:
                         const StreamWriteOptions* options = NULL);
     static int Create(const StreamOptions& options,
                       const StreamSettings *remote_settings,
-                      StreamId *id);
+                      StreamId *id, bool parse_rpc_response = true);
     StreamId id() { return _id; }
 
     int OnReceived(const StreamFrameMeta& fm, butil::IOBuf *buf, Socket* sock);
@@ -63,6 +64,8 @@ public:
     void FillSettings(StreamSettings *settings);
     static int SetFailed(StreamId id, int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));
+    static int SetFailed(const StreamIds& ids, int error_code, const char* reason_fmt, ...)
+    __attribute__ ((__format__ (__printf__, 3, 4)));
     void Close(int error_code, const char* reason_fmt, ...)
         __attribute__ ((__format__ (__printf__, 3, 4)));
 
@@ -131,6 +134,7 @@ friend struct butil::DefaultDeleter<Stream>;
     butil::IOBuf *_pending_buf;
     int64_t _start_idle_timer_us;
     bthread_timer_t _idle_timer;
+    std::once_flag _set_host_socket_flag;
 };
 
 } // namespace brpc

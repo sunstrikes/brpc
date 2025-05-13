@@ -58,8 +58,8 @@ uint64_t GetStride(const uint64_t weight_sum, const size_t num) {
       return 1;
     }
     uint32_t average_weight = weight_sum / num;
-    auto iter = std::lower_bound(prime_stride.begin(), prime_stride.end(),
-                                 average_weight);
+    auto iter = std::lower_bound(
+        prime_stride.begin(), prime_stride.end(), average_weight);
     while (iter != prime_stride.end()
            && !IsCoprime(weight_sum, *iter)) {
         ++iter;
@@ -150,9 +150,6 @@ size_t WeightedRoundRobinLoadBalancer::AddServersInBatch(
 size_t WeightedRoundRobinLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 
@@ -200,7 +197,7 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
             }
             filter.emplace(server_id);
             remain_weight -= (s->server_list[s->server_map.at(server_id)]).weight;
-            // Select from begining status.
+            // Select from beginning status.
             tls_temp.stride = GetStride(remain_weight, remain_servers);
             tls_temp.position = tls.position;
             tls_temp.remain_server = tls.remain_server;

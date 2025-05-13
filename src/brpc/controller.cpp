@@ -258,6 +258,7 @@ void Controller::ResetPods() {
     _connection_type = CONNECTION_TYPE_UNKNOWN;
     _timeout_ms = UNSET_MAGIC_NUM;
     _backup_request_ms = UNSET_MAGIC_NUM;
+    _backup_request_policy = NULL;
     _connect_timeout_ms = UNSET_MAGIC_NUM;
     _real_timeout_ms = UNSET_MAGIC_NUM;
     _deadline_us = -1;
@@ -289,8 +290,10 @@ void Controller::ResetPods() {
     _http_response = NULL;
     _request_user_fields = NULL;
     _response_user_fields = NULL;
-    _request_stream = INVALID_STREAM_ID;
-    _response_stream = INVALID_STREAM_ID;
+    _request_content_type = CONTENT_TYPE_PB;
+    _response_content_type = CONTENT_TYPE_PB;
+    _request_streams.clear();
+    _response_streams.clear();
     _remote_stream_settings = NULL;
     _auth_flags = 0;
 }
@@ -342,6 +345,16 @@ void Controller::set_backup_request_ms(int64_t timeout_ms) {
         _backup_request_ms = 0x7fffffff;
         LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
     }
+}
+
+int64_t Controller::backup_request_ms() const {
+    int timeout_ms = NULL != _backup_request_policy ?
+        _backup_request_policy->GetBackupRequestMs(this) : _backup_request_ms;
+    if (timeout_ms > 0x7fffffff) {
+        timeout_ms = 0x7fffffff;
+        LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
+    }
+    return timeout_ms;
 }
 
 void Controller::set_max_retry(int max_retry) {
@@ -606,6 +619,13 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         goto END_OF_RPC;
     }
     if (_error_code == EBACKUPREQUEST) {
+        if (NULL != _backup_request_policy && !_backup_request_policy->DoBackup(this)) {
+            // No need to do backup request.
+            _error_code = saved_error;
+            CHECK_EQ(0, bthread_id_unlock(info.id));
+            return;
+        }
+
         // Reset timeout if needed
         int rc = 0;
         if (timeout_ms() >= 0) {
@@ -969,6 +989,14 @@ void Controller::EndRPC(const CompletionInfo& info) {
         CHECK_EQ(0, bthread_id_unlock_and_destroy(saved_cid));
     }
 }
+
+void Controller::OnRPCEnd(int64_t end_time_us) {
+    _end_time_us = end_time_us;
+    if (NULL != _backup_request_policy) {
+        _backup_request_policy->OnRPCEnd(this);
+    }
+}
+
 void Controller::RunDoneInBackupThread(void* arg) {
     static_cast<Controller*>(arg)->DoneInBackupThread();
 }
@@ -1313,6 +1341,7 @@ CallId Controller::call_id() {
 void Controller::SaveClientSettings(ClientSettings* s) const {
     s->timeout_ms = _timeout_ms;
     s->backup_request_ms = _backup_request_ms;
+    s->backup_request_policy = _backup_request_policy;
     s->max_retry = _max_retry;
     s->tos = _tos;
     s->connection_type = _connection_type;
@@ -1325,6 +1354,7 @@ void Controller::SaveClientSettings(ClientSettings* s) const {
 void Controller::ApplyClientSettings(const ClientSettings& s) {
     set_timeout_ms(s.timeout_ms);
     set_backup_request_ms(s.backup_request_ms);
+    set_backup_request_policy(s.backup_request_policy);
     set_max_retry(s.max_retry);
     set_type_of_service(s.tos);
     set_connection_type(s.connection_type);
@@ -1370,34 +1400,54 @@ void* Controller::session_local_data() {
 }
 
 void Controller::HandleStreamConnection(Socket *host_socket) {
-    if (_request_stream == INVALID_STREAM_ID) {
+    if (_request_streams.empty()) {
         CHECK(!has_remote_stream());
         return;
     }
-    SocketUniquePtr ptr;
+    size_t stream_num = _request_streams.size();
+    std::vector<SocketUniquePtr> ptrs(stream_num);
     if (!FailedInline()) {
-        if (Socket::Address(_request_stream, &ptr) != 0) {
-            if (!FailedInline()) {
-                SetFailed(EREQUEST, "Request stream=%" PRIu64 " was closed before responded",
-                                     _request_stream);
-            }
-        } else if (_remote_stream_settings == NULL) {
+        if (_remote_stream_settings == NULL) {
             if (!FailedInline()) {
                 SetFailed(EREQUEST, "The server didn't accept the stream");
+            }
+        } else {
+            for (size_t i = 0; i < stream_num; ++i) {
+                if (Socket::Address(_request_streams[i], &ptrs[i]) != 0) {
+                    if (!FailedInline()) {
+                        SetFailed(EREQUEST, "Request stream=%" PRIu64 " was closed before responded",
+                                  _request_streams[i]);
+                        break;
+                    }
+                }
             }
         }
     }
     if (FailedInline()) {
-        Stream::SetFailed(_request_stream, _error_code,
+        Stream::SetFailed(_request_streams, _error_code,
                           "%s", _error_text.c_str());
         if (_remote_stream_settings != NULL) {
             policy::SendStreamRst(host_socket,
                                   _remote_stream_settings->stream_id());
+            for (int i = 0; i < _remote_stream_settings->extra_stream_ids().size(); ++i) {
+                policy::SendStreamRst(host_socket,
+                                      _remote_stream_settings->extra_stream_ids()[i]);
+            }
         }
         return;
     }
-    Stream* s = (Stream*)ptr->conn();
+    Stream* s = (Stream*)ptrs[0]->conn();
     s->SetConnected(_remote_stream_settings);
+    if (stream_num > 1) {
+        auto extra_stream_ids = std::move(*_remote_stream_settings->mutable_extra_stream_ids());
+        _remote_stream_settings->clear_extra_stream_ids();
+        for (size_t i = 1; i < stream_num; ++i) {
+            Stream* extra_stream = (Stream *) ptrs[i]->conn();
+            _remote_stream_settings->set_stream_id(extra_stream_ids[i - 1]);
+            s->SetHostSocket(host_socket);
+            extra_stream->SetConnected(_remote_stream_settings);
+        }
+    }
 }
 
 // TODO: Need more security advices from professionals.
@@ -1425,6 +1475,12 @@ std::string WebEscape(const std::string& source) {
 void Controller::reset_sampled_request(SampledRequest* req) {
     delete _sampled_request;
     _sampled_request = req;
+}
+
+SampledRequest* Controller::release_sampled_request() {
+    SampledRequest* saved_sampled_request = _sampled_request;
+    _sampled_request = NULL;
+    return saved_sampled_request;
 }
 
 void Controller::set_stream_creator(StreamCreator* sc) {

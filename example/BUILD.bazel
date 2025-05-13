@@ -28,7 +28,6 @@ COPTS = [
     "-fPIC",
     "-Wno-unused-parameter",
     "-fno-omit-frame-pointer",
-    "-DGFLAGS_NS=google",
 ] + select({
     "//bazel/config:brpc_with_glog": ["-DBRPC_WITH_GLOG=1"],
     "//conditions:default": ["-DBRPC_WITH_GLOG=0"],
@@ -121,6 +120,17 @@ cc_binary(
     copts = COPTS + ["-DBRPC_WITH_RDMA=1"],
     deps = [
         ":cc_rdma_performance_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "redis_c++_server",
+    srcs = [
+        "redis_c++/redis_server.cpp",
+    ],
+    copts = COPTS,
+    deps = [
         "//:brpc",
     ],
 )

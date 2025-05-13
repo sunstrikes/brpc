@@ -55,7 +55,8 @@ extern int bthread_timer_del(bthread_timer_t id);
 
 // Suspend caller thread until the file descriptor `fd' has `epoll_events'.
 // Returns 0 on success, -1 otherwise and errno is set.
-// NOTE: Due to an epoll bug(https://patchwork.kernel.org/patch/1970231),
+// NOTE: Due to an epoll
+// bug(https://web.archive.org/web/20150423184820/https://patchwork.kernel.org/patch/1970231/),
 // current implementation relies on EPOLL_CTL_ADD and EPOLL_CTL_DEL which
 // are not scalable, don't use bthread_fd_*wait functions in performance
 // critical scenario.
@@ -127,6 +128,10 @@ extern int bthread_keytable_pool_destroy(bthread_keytable_pool_t*);
 // Put statistics of `pool' into `stat'.
 extern int bthread_keytable_pool_getstat(bthread_keytable_pool_t* pool,
                                          bthread_keytable_pool_stat_t* stat);
+
+// [RPC INTERNAL]
+// Return thread local keytable list length if exist.
+extern int get_thread_local_keytable_list_length(bthread_keytable_pool_t* pool);
 
 // [RPC INTERNAL]
 // Reserve at most `nfree' keytables with `key' pointing to data created by

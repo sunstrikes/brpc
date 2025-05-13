@@ -20,14 +20,24 @@
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/logging.h"
-#include "butil/logging.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "bthread/bthread.h"
 #include "bthread/unstable.h"
 #include "bthread/task_meta.h"
 
+int main(int argc, char* argv[]) {
+    testing::InitGoogleTest(&argc, argv);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    int rc = RUN_ALL_TESTS();
+    return rc;
+}
+
 namespace bthread {
-    extern __thread bthread::LocalStorage tls_bls;
+extern __thread bthread::LocalStorage tls_bls;
+DECLARE_bool(enable_fast_unwind);
+#ifdef BRPC_BTHREAD_TRACER
+extern std::string stack_trace(bthread_t tid);
+#endif // BRPC_BTHREAD_TRACER
 }
 
 namespace {
@@ -101,6 +111,7 @@ TEST_F(BthreadTest, call_bthread_functions_before_tls_created) {
     ASSERT_EQ(0UL, bthread_self());
 }
 
+butil::atomic<bool> start(false);
 butil::atomic<bool> stop(false);
 
 void* sleep_for_awhile(void* arg) {
@@ -118,6 +129,7 @@ void* just_exit(void* arg) {
 }
 
 void* repeated_sleep(void* arg) {
+    start = true;
     for (size_t i = 0; !stop; ++i) {
         LOG(INFO) << "repeated_sleep(" << arg << ") i=" << i;
         bthread_usleep(1000000L);
@@ -126,6 +138,7 @@ void* repeated_sleep(void* arg) {
 }
 
 void* spin_and_log(void* arg) {
+    start = true;
     // This thread never yields CPU.
     butil::EveryManyUS every_1s(1000000L);
     size_t i = 0;
@@ -217,6 +230,7 @@ TEST_F(BthreadTest, backtrace) {
     for (int i = 0; i < bt_cnt; ++i) {
         puts(text[i]);
     }
+    free(text);
 }
 
 void* show_self(void*) {
@@ -317,7 +331,7 @@ TEST_F(BthreadTest, small_threads) {
             LOG(INFO) << "[Round " << j + 1 << "] bthread_start_urgent takes "
                       << tm.n_elapsed()/N << "ns, sum=" << s;
             ASSERT_EQ(N * (j + 1), (size_t)s);
-        
+
             // Check uniqueness of th
             std::sort(th.begin(), th.end());
             ASSERT_EQ(th.end(), std::unique(th.begin(), th.end()));
@@ -326,9 +340,14 @@ TEST_F(BthreadTest, small_threads) {
 }
 
 void* bthread_starter(void* void_counter) {
+    std::vector<bthread_t> ths;
     while (!stop.load(butil::memory_order_relaxed)) {
         bthread_t th;
         EXPECT_EQ(0, bthread_start_urgent(&th, NULL, adding_func, void_counter));
+        ths.push_back(th);
+    }
+    for (size_t i = 0; i < ths.size(); ++i) {
+        EXPECT_EQ(0, bthread_join(ths[i], NULL));
     }
     return NULL;
 }
@@ -348,7 +367,7 @@ TEST_F(BthreadTest, start_bthreads_frequently) {
     bthread_t th[con];
 
     std::cout << "Perf with different parameters..." << std::endl;
-    //ProfilerStart(prof_name);
+    ProfilerStart(prof_name);
     for (int cur_con = 1; cur_con <= con; ++cur_con) {
         stop = false;
         for (int i = 0; i < cur_con; ++i) {
@@ -371,7 +390,7 @@ TEST_F(BthreadTest, start_bthreads_frequently) {
         std::cout << sum << ",";
     }
     std::cout << std::endl;
-    //ProfilerStop();
+    ProfilerStop();
     delete [] counters;
 }
 
@@ -581,8 +600,9 @@ TEST_F(BthreadTest, test_span) {
                                           test_son_parent_span, &multi_p2));
     ASSERT_EQ(0, bthread_join(multi_th1, NULL));
     ASSERT_EQ(0, bthread_join(multi_th2, NULL));
-    ASSERT_EQ(multi_p1, targets[0]);
-    ASSERT_EQ(multi_p2, targets[1]);
+    ASSERT_NE(multi_p1, multi_p2);
+    ASSERT_NE(std::find(targets, targets + 4, multi_p1), targets + 4);
+    ASSERT_NE(std::find(targets, targets + 4, multi_p2), targets + 4);
 }
 
 void* dummy_thread(void*) {
@@ -607,5 +627,77 @@ TEST_F(BthreadTest, yield_single_thread) {
     ASSERT_EQ(0, bthread_start_background(&tid, NULL, yield_thread, NULL));
     ASSERT_EQ(0, bthread_join(tid, NULL));
 }
+
+#ifdef BRPC_BTHREAD_TRACER
+void spin_and_log_trace() {
+    bool ok = false;
+    for (int i = 0; i < 10; ++i) {
+        start = false;
+        stop = false;
+        bthread_t th;
+        ASSERT_EQ(0, bthread_start_urgent(&th, NULL, spin_and_log, (void*)1));
+        while (!start) {
+            usleep(10 * 1000);
+        }
+        bthread::FLAGS_enable_fast_unwind = false;
+        std::string st1 = bthread::stack_trace(th);
+        LOG(INFO) << "spin_and_log stack trace:\n" << st1;
+
+        bthread::FLAGS_enable_fast_unwind = true;
+        std::string st2 = bthread::stack_trace(th);
+        LOG(INFO) << "fast_unwind spin_and_log stack trace:\n" << st2;
+        stop = true;
+        ASSERT_EQ(0, bthread_join(th, NULL));
+
+        std::string st3 = bthread::stack_trace(th);
+        LOG(INFO) << "ended bthread stack trace:\n" << st3;
+        ASSERT_NE(std::string::npos, st3.find("not exist now"));
+
+        ok = st1.find("spin_and_log") != std::string::npos &&
+             st2.find("spin_and_log") != std::string::npos;
+        if (ok) {
+            break;
+        }
+    }
+    ASSERT_TRUE(ok);
+}
+
+void repeated_sleep_trace() {
+    bool ok = false;
+    for (int i = 0; i < 10; ++i) {
+        start = false;
+        stop = false;
+        bthread_t th;
+        ASSERT_EQ(0, bthread_start_urgent(&th, NULL, repeated_sleep, (void*)1));
+        while (!start) {
+            usleep(10 * 1000);
+        }
+        bthread::FLAGS_enable_fast_unwind = false;
+        std::string st1 = bthread::stack_trace(th);
+        LOG(INFO) << "repeated_sleep stack trace:\n" << st1;
+
+        bthread::FLAGS_enable_fast_unwind = true;
+        std::string st2 = bthread::stack_trace(th);
+        LOG(INFO) << "fast_unwind repeated_sleep stack trace:\n" << st2;
+        stop = true;
+        ASSERT_EQ(0, bthread_join(th, NULL));
+
+        std::string st3 = bthread::stack_trace(th);
+        LOG(INFO) << "ended bthread stack trace:\n" << st3;
+        ASSERT_NE(std::string::npos, st3.find("not exist now"));
+        ok = st1.find("repeated_sleep") != std::string::npos &&
+             st2.find("repeated_sleep") != std::string::npos;
+        if (ok) {
+            break;
+        }
+    }
+    ASSERT_TRUE(ok);
+}
+
+TEST_F(BthreadTest, trace) {
+    spin_and_log_trace();
+    repeated_sleep_trace();
+}
+#endif // BRPC_BTHREAD_TRACER
 
 } // namespace

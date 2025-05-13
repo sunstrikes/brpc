@@ -24,6 +24,7 @@
 
 #include "brpc/controller.h"
 #include "brpc/channel.h"
+#include "brpc/socket.h"
 #include "brpc/stream_impl.h"
 #include "brpc/policy/streaming_rpc_protocol.h"
 #include "echo.pb.h"
@@ -239,7 +240,6 @@ TEST_F(StreamingRpcTest, block) {
     out.append(&dummy, sizeof(dummy));
     ASSERT_EQ(EAGAIN, brpc::StreamWrite(request_stream, out));
     hc.block = false;
-    ASSERT_EQ(0, brpc::StreamWait(request_stream, NULL));
     // wait flushing all the pending messages
     while (handler._expected_next_value != N) {
         usleep(100);
@@ -248,6 +248,7 @@ TEST_F(StreamingRpcTest, block) {
     hc.block = true;
     // async wait
     for (int i = N; i < N + N; ++i) {
+        ASSERT_EQ(0, brpc::StreamWait(request_stream, NULL));
         int network = htonl(i);
         butil::IOBuf out;
         out.append(&network, sizeof(network));
@@ -431,18 +432,12 @@ TEST_F(StreamingRpcTest, idle_timeout) {
 
 class PingPongHandler : public brpc::StreamInputHandler {
 public:
-    explicit PingPongHandler()
-        : _expected_next_value(0)
-        , _failed(false)
-        , _stopped(false)
-        , _idle_times(0)
-    {
-    }
     int on_received_messages(brpc::StreamId id,
                              butil::IOBuf *const messages[],
                              size_t size) override {
         if (size != 1) {
-            _failed = true;
+            LOG(INFO) << "size=" << size;
+            _error = true;
             return 0;
         }
         for (size_t i = 0; i < size; ++i) {
@@ -450,7 +445,7 @@ public:
             int network = 0;
             messages[i]->cutn(&network, sizeof(int));
             if ((int)ntohl(network) != _expected_next_value) {
-                _failed = true;
+                _error = true;
             }
             int send_back = ntohl(network) + 1;
             _expected_next_value = send_back + 1;
@@ -480,14 +475,16 @@ public:
         _failed = true;
     }
 
+    bool error() const { return _error; }
     bool failed() const { return _failed; }
     bool stopped() const { return _stopped; }
     int idle_times() const { return _idle_times; }
 private:
-    int _expected_next_value;
-    bool _failed;
-    bool _stopped;
-    int _idle_times;
+    int _expected_next_value{0};
+    bool _error{false};
+    bool _failed{false};
+    bool _stopped{false};
+    int _idle_times{0};
 };
 
 TEST_F(StreamingRpcTest, ping_pong) {
@@ -523,8 +520,8 @@ TEST_F(StreamingRpcTest, ping_pong) {
     while (!resh.stopped() || !reqh.stopped()) {
         usleep(100);
     }
-    ASSERT_FALSE(resh.failed());
-    ASSERT_FALSE(reqh.failed());
+    ASSERT_FALSE(resh.error());
+    ASSERT_FALSE(reqh.error());
     ASSERT_EQ(0, resh.idle_times());
     ASSERT_EQ(0, reqh.idle_times());
 }
@@ -576,4 +573,58 @@ TEST_F(StreamingRpcTest, server_send_data_before_run_done) {
     }
     ASSERT_FALSE(handler.failed());
     ASSERT_EQ(0, handler.idle_times());
+}
+
+TEST_F(StreamingRpcTest, segment_stream_data_automatically) {
+    GFLAGS_NAMESPACE::SetCommandLineOption("stream_write_max_segment_size", "1");
+    OrderedInputHandler handler;
+    brpc::StreamOptions opt;
+    opt.handler = &handler;
+    opt.messages_in_batch = 100;
+    brpc::Server server;
+    MyServiceWithStream service(opt);
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(9007, NULL));
+    brpc::Channel channel;
+    ASSERT_EQ(0, channel.Init("127.0.0.1:9007", NULL));
+    brpc::Controller cntl;
+    brpc::StreamId request_stream;
+    brpc::StreamOptions request_stream_options;
+    ASSERT_EQ(0, StreamCreate(&request_stream, cntl, &request_stream_options));
+    brpc::ScopedStream stream_guard(request_stream);
+    test::EchoService_Stub stub(&channel);
+    stub.Echo(&cntl, &request, &response, NULL);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText() << " request_stream=" << request_stream;
+    const int N = 1000;
+    for (int i = 0; i < N; ++i) {
+        int network = htonl(i);
+        butil::IOBuf out;
+        out.append(&network, sizeof(network));
+        ASSERT_EQ(0, brpc::StreamWrite(request_stream, out)) << "i=" << i;
+    }
+
+    brpc::SocketUniquePtr host_socket_ptr;
+    {
+      brpc::SocketUniquePtr ptr;
+      ASSERT_EQ(0, brpc::Socket::Address(request_stream, &ptr));
+      brpc::Stream *s = (brpc::Stream *)ptr->conn();
+      ASSERT_TRUE(s->_host_socket != NULL);
+      s->_host_socket->ReAddress(&host_socket_ptr);
+    }
+
+    ASSERT_EQ(0, brpc::StreamClose(request_stream));
+    server.Stop(0);
+    server.Join();
+    while (!handler.stopped()) {
+        usleep(100);
+    }
+    const int64_t now_ms = butil::cpuwide_time_ms();
+    host_socket_ptr->UpdateStatsEverySecond(now_ms);
+    brpc::SocketStat stat;
+    host_socket_ptr->GetStat(&stat);
+    ASSERT_LT(N * sizeof(N), stat.out_num_messages_m);
+    ASSERT_FALSE(handler.failed());
+    ASSERT_EQ(0, handler.idle_times());
+    ASSERT_EQ(N, handler._expected_next_value);
+    GFLAGS_NAMESPACE::SetCommandLineOption("stream_write_max_segment_size", "536870912");
 }

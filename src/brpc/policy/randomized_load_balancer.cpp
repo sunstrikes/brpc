@@ -25,14 +25,6 @@
 namespace brpc {
 namespace policy {
 
-const uint32_t prime_offset[] = {
-#include "bthread/offset_inl.list"
-};
-
-inline uint32_t GenRandomStride() {
-    return prime_offset[butil::fast_rand_less_than(ARRAY_SIZE(prime_offset))];
-}
-
 bool RandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
     if (bg.server_list.capacity() < 128) {
         bg.server_list.reserve(128);
@@ -97,9 +89,6 @@ size_t RandomizedLoadBalancer::AddServersInBatch(
 size_t RandomizedLoadBalancer::RemoveServersInBatch(
     const std::vector<ServerId>& servers) {
     const size_t n = _db_servers.Modify(BatchRemove, servers);
-    LOG_IF(ERROR, n != servers.size())
-        << "Fail to RemoveServersInBatch, expected " << servers.size()
-        << " actually " << n;
     return n;
 }
 

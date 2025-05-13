@@ -27,8 +27,9 @@
 #include "butil/memory/scoped_ptr.h"     // butil::scoped_ptr
 #include "butil/logging.h"               // LOG
 #include "butil/time.h"                  // butil::cpuwide_time_ns
-#include "bvar/bvar.h"                  // bvar::Adder
-#include "bthread/butex.h"              // butex_construct
+#include "butil/object_pool.h"           // butil::get_object
+#include "bvar/bvar.h"                   // bvar::Adder
+#include "bthread/butex.h"               // butex_construct
 #include "butil/synchronization/condition_variable.h"
 
 namespace bthread {
@@ -38,17 +39,17 @@ struct ExecutionQueueId {
     uint64_t value;
 };
 
-enum TaskStatus {
-    UNEXECUTED = 0,
-    EXECUTING = 1,
-    EXECUTED = 2
-};
-
 struct TaskNode;
 class ExecutionQueueBase;
 typedef void (*clear_task_mem)(TaskNode*);
 
 struct BAIDU_CACHELINE_ALIGNMENT TaskNode {
+    enum TaskStatus {
+        UNEXECUTED = 0,
+        EXECUTING = 1,
+        EXECUTED = 2
+    };
+
     TaskNode()
         : version(0)
         , status(UNEXECUTED)
@@ -584,5 +585,12 @@ inline int ExecutionQueueBase::dereference() {
 }
 
 }  // namespace bthread
+
+namespace butil {
+// `TaskNode::cancel' may access the TaskNode object returned to the ObjectPool<TaskNode>,
+// so ObjectPool<TaskNode> can not poison the memory region of TaskNode.
+template <>
+struct ObjectPoolWithASanPoison<bthread::TaskNode> : false_type {};
+} // namespace butil
 
 #endif  //BTHREAD_EXECUTION_QUEUE_INL_H

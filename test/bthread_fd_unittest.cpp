@@ -16,13 +16,14 @@
 // under the License.
 
 #include "butil/compat.h"
+#include "butil/compiler_specific.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/utsname.h>                           // uname
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <pthread.h>
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/fd_utility.h"
@@ -34,9 +35,11 @@
 #include "bthread/interrupt_pthread.h"
 #include "bthread/bthread.h"
 #include "bthread/unstable.h"
+#include <netinet/tcp.h>
 #if defined(OS_MACOSX)
 #include <sys/types.h>                           // struct kevent
 #include <sys/event.h>                           // kevent(), kqueue()
+#include <netinet/tcp_fsm.h>
 #endif
 
 #ifndef NDEBUG
@@ -326,7 +329,7 @@ TEST(FDTest, ping_pong) {
     }
     tm.stop();
     ProfilerStop();
-    LOG(INFO) << "tid=" << REP*NCLIENT*1000000L/tm.u_elapsed();
+    LOG(INFO) << "tid=" << REP*NCLIENT * 1000000L / tm.u_elapsed();
     stop = true;
     for (size_t i = 0; i < NEPOLL; ++i) {
 #if defined(OS_LINUX)
@@ -558,15 +561,18 @@ TEST(FDTest, double_close) {
     ASSERT_EQ(ec, errno);
 }
 
-const char* g_hostname = "baidu.com";
+const char* g_hostname1 = "github.com";
+const char* g_hostname2 = "baidu.com";
 TEST(FDTest, bthread_connect) {
-    butil::EndPoint ep;
-    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname, 80, &ep));
+    butil::EndPoint ep1;
+    butil::EndPoint ep2;
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname1, 80, &ep1));
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname2, 80, &ep2));
 
     {
         struct sockaddr_storage serv_addr{};
         socklen_t serv_addr_size = 0;
-        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        ASSERT_EQ(0, endpoint2sockaddr(ep1, &serv_addr, &serv_addr_size));
         butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
         ASSERT_LE(0, sockfd);
         bool is_blocking = butil::is_blocking(sockfd);
@@ -579,7 +585,7 @@ TEST(FDTest, bthread_connect) {
     {
         struct sockaddr_storage serv_addr{};
         socklen_t serv_addr_size = 0;
-        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        ASSERT_EQ(0, endpoint2sockaddr(ep2, &serv_addr, &serv_addr_size));
         butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
         ASSERT_LE(0, sockfd);
         bool is_blocking = butil::is_blocking(sockfd);
@@ -592,6 +598,54 @@ TEST(FDTest, bthread_connect) {
         ASSERT_EQ(ETIMEDOUT, errno);
         ASSERT_EQ(is_blocking, butil::is_blocking(sockfd));
     }
+}
+
+void TestConnectInterruptImpl(bool timed) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname1, 80, &ep));
+    struct sockaddr_storage serv_addr{};
+    socklen_t serv_addr_size = 0;
+    ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+    butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
+    ASSERT_GE(sockfd, 0);
+
+    int rc;
+    if (timed) {
+        int64_t start_ms = butil::cpuwide_time_ms();
+        butil::tcp_connect(ep, NULL);
+        int64_t connect_ms = butil::cpuwide_time_ms() - start_ms;
+        LOG(INFO) << "Connect to " << ep << ", cost " << connect_ms << "ms";
+
+        timespec abstime = butil::milliseconds_from_now(connect_ms * 10);
+        rc = bthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr,
+            serv_addr_size, &abstime);
+    } else {
+        rc = bthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr,
+            serv_addr_size, NULL);
+    }
+    ASSERT_EQ(0, rc) << "errno=" << errno;
+    ASSERT_EQ(0, butil::is_connected(sockfd));
+
+}
+
+void* ConnectThread(void* arg) {
+    bool timed = *(bool*)arg;
+    TestConnectInterruptImpl(timed);
+    return NULL;
+}
+
+void TestConnectInterrupt(bool timed) {
+    bthread_t tid;
+    ASSERT_EQ(0, bthread_start_background(&tid, NULL, ConnectThread, &timed));
+    ASSERT_EQ(0, bthread_stop(tid));
+    ASSERT_EQ(0, bthread_join(tid, NULL));
+}
+
+TEST(FDTest, interrupt) {
+    TestConnectInterrupt(false);
+    TestConnectInterrupt(true);
 }
 
 } // namespace

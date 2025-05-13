@@ -23,6 +23,7 @@
 #include <string>
 #include <google/protobuf/message.h>
 #include <google/protobuf/io/zero_copy_stream.h> // ZeroCopyOutputStream
+#include <google/protobuf/util/json_util.h>
 
 namespace json2pb {
 
@@ -79,7 +80,7 @@ bool ProtoMessageToJson(const google::protobuf::Message& message,
                         std::string* error = NULL);
 // send output to ZeroCopyOutputStream instead of std::string.
 bool ProtoMessageToJson(const google::protobuf::Message& message,
-                        google::protobuf::io::ZeroCopyOutputStream *json,
+                        google::protobuf::io::ZeroCopyOutputStream* json,
                         const Pb2JsonOptions& options,
                         std::string* error = NULL);
 
@@ -90,6 +91,25 @@ bool ProtoMessageToJson(const google::protobuf::Message& message,
 bool ProtoMessageToJson(const google::protobuf::Message& message,
                         google::protobuf::io::ZeroCopyOutputStream* json,
                         std::string* error = NULL);
+
+// See <google/protobuf/util/json_util.h> for details.
+using Pb2ProtoJsonOptions = google::protobuf::util::JsonOptions;
+
+#if GOOGLE_PROTOBUF_VERSION >= 5026002
+#define AlwaysPrintPrimitiveFields(options) options.always_print_fields_with_no_presence
+#else
+#define AlwaysPrintPrimitiveFields(options) options.always_print_primitive_fields
+#endif
+
+// Convert protobuf `messge' to `json' in ProtoJSON format according to `options'.
+// See https://protobuf.dev/programming-guides/json/ for details.
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message,
+                             google::protobuf::io::ZeroCopyOutputStream* json,
+                             const Pb2ProtoJsonOptions& options = Pb2ProtoJsonOptions(),
+                             std::string* error = NULL);
+bool ProtoMessageToProtoJson(const google::protobuf::Message& message, std::string* json,
+                             const Pb2ProtoJsonOptions& options = Pb2ProtoJsonOptions(),
+                             std::string* error = NULL);
 } // namespace json2pb
 
 #endif // BRPC_JSON2PB_PB_TO_JSON_H

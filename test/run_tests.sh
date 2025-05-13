@@ -26,7 +26,10 @@ test_bins="test_butil test_bvar bthread*unittest brpc*unittest"
 for test_bin in $test_bins; do
     test_num=$((test_num + 1))
     >&2 echo "[runtest] $test_bin"
-    ./$test_bin
+    ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1" ./$test_bin
+    # If ASan abort without detailed call stack of new/delete,
+    # try to disable fast_unwind_on_malloc, which would be a performance killer.
+    # ASAN_OPTIONS="fast_unwind_on_malloc=0:detect_leaks=0" ./$test_bin
     rc=$?
     if [ $rc -ne 0 ]; then
         failed_test="$test_bin"
@@ -43,7 +46,7 @@ print_bt () {
     COREFILE=$(find . -name "core*" -type f -printf "%T@ %p\n" | sort -k 1 -n | cut -d' ' -f 2- | tail -n 1)
     if [ ! -z "$COREFILE" ]; then
         >&2 echo "corefile=$COREFILE prog=$1"
-        gdb -c "$COREFILE" $1 -ex "thread apply all bt" -ex "set pagination 0" -batch;
+        gdb -c "$COREFILE" $1 -ex "bt" -ex "thread apply all bt" -ex "set pagination 0" -batch;
     fi
 }
 

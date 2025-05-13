@@ -48,9 +48,8 @@ public:
     void List(std::ostream& os, char separator);
 
 private:
-friend class butil::GetLeakySingleton<Extension<T> >;
-    Extension();
-    ~Extension();
+template <typename U> friend U* butil::create_leaky_singleton_obj();
+    Extension() = default;
     butil::CaseIgnoredFlatMap<T*> _instance_map;
     butil::Mutex _map_mutex;
 };

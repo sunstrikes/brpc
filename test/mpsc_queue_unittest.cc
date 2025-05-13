@@ -120,5 +120,22 @@ TEST(MPSCQueueTest, mpsc_multi_thread) {
 
 }
 
+struct MyObject {};
+
+TEST(MPSCQueueTest, mpsc_test_allocator) {
+    butil::ObjectPoolAllocator<MyObject> alloc;
+
+    auto  p = alloc.Alloc();
+    butil::ObjectPoolInfo info = butil::describe_objects<butil::MPSCQueueNode<MyObject>>();
+    ASSERT_EQ(1, info.item_num);
+
+    alloc.Free(p);
+    info = butil::describe_objects<butil::MPSCQueueNode<MyObject>>();
+    ASSERT_EQ(1, info.item_num);
+
+    p = alloc.Alloc();
+    info = butil::describe_objects<butil::MPSCQueueNode<MyObject>>();
+    ASSERT_EQ(1, info.item_num);
+}
 
 }

@@ -35,9 +35,15 @@ int ConstantConcurrencyLimiter::MaxConcurrency() {
     return _max_concurrency.load(butil::memory_order_relaxed);
 }
 
+int ConstantConcurrencyLimiter::ResetMaxConcurrency(
+    const AdaptiveMaxConcurrency& amc) {
+    _max_concurrency.store(static_cast<int>(amc), butil::memory_order_relaxed);
+    return 0;
+}
+
 ConstantConcurrencyLimiter*
 ConstantConcurrencyLimiter::New(const AdaptiveMaxConcurrency& amc) const {
-    CHECK_EQ(amc.type(), AdaptiveMaxConcurrency::CONSTANT());
+    CHECK_EQ(amc.type(), AdaptiveMaxConcurrency::CONSTANT);
     return new ConstantConcurrencyLimiter(static_cast<int>(amc));
 }
 

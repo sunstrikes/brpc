@@ -29,7 +29,6 @@ COPTS = [
     "-D__STDC_FORMAT_MACROS",
     "-D__STDC_LIMIT_MACROS",
     "-D__STDC_CONSTANT_MACROS",
-    "-DGFLAGS_NS=google",
 ] + select({
     "//bazel/config:brpc_with_glog": ["-DBRPC_WITH_GLOG=1"],
     "//conditions:default": ["-DBRPC_WITH_GLOG=0"],
@@ -45,13 +44,25 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_rdma": ["-DBRPC_WITH_RDMA=1"],
     "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_with_debug_bthread_sche_safety": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=1"],
+    "//conditions:default": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=0"],
+}) + select({
+    "//bazel/config:brpc_with_debug_lock": ["-DBRPC_DEBUG_LOCK=1"],
+    "//conditions:default": ["-DBRPC_DEBUG_LOCK=0"],
+}) + select({
+    "@platforms//cpu:x86_64": ["-DBRPC_BTHREAD_TRACER"],
+    "//conditions:default": [],
+}) + select({
+    "//bazel/config:brpc_with_asan": ["-fsanitize=address"],
+    "//conditions:default": [""],
 })
 
 LINKOPTS = [
     "-pthread",
     "-ldl",
 ] + select({
-    "@bazel_tools//tools/osx:darwin": [
+    "@bazel_tools//src/conditions:darwin": [
         "-framework CoreFoundation",
         "-framework CoreGraphics",
         "-framework CoreData",
@@ -63,6 +74,8 @@ LINKOPTS = [
         "-Wl,-U,_ProfilerStop",
         "-Wl,-U,__Z13GetStackTracePPvii",
         "-Wl,-U,_RegisterThriftProtocol",
+        "-Wl,-U,_mallctl",
+        "-Wl,-U,_malloc_stats_print",
     ],
     "//conditions:default": [
         "-lrt",
@@ -77,7 +90,10 @@ LINKOPTS = [
         "-libverbs",
     ],
     "//conditions:default": [],
-})
+}) + select({
+        "//bazel/config:brpc_with_asan": ["-fsanitize=address"],
+        "//conditions:default": [""],
+  })
 
 genrule(
     name = "config_h",
@@ -218,7 +234,7 @@ BUTIL_SRCS = [
     "src/butil/recordio.cc",
     "src/butil/popen.cpp",
 ] + select({
-    "@bazel_tools//tools/osx:darwin": [
+    "@bazel_tools//src/conditions:darwin": [
         "src/butil/time/time_mac.cc",
         "src/butil/mac/scoped_mach_port.cc",
     ],
@@ -333,7 +349,7 @@ cc_library(
         "//bazel/config:brpc_with_glog": ["@com_github_google_glog//:glog"],
         "//conditions:default": [],
     }) + select({
-        "@bazel_tools//tools/osx:darwin": [":macos_lib"],
+        "@bazel_tools//src/conditions:darwin": [":macos_lib"],
         "//conditions:default": [],
     }) + select({
         "//bazel/config:brpc_with_boringssl": ["@boringssl//:ssl", "@boringssl//:crypto"],
@@ -395,7 +411,10 @@ cc_library(
     deps = [
         ":butil",
         ":bvar",
-    ],
+    ] + select({
+        "@platforms//cpu:x86_64": ["@com_github_libunwind_libunwind//:libunwind"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -437,7 +456,7 @@ cc_library(
     deps = [
         ":brpc_idl_options_cc_proto",
         ":butil",
-        "@com_google_protobuf//:protoc_lib",
+        "@com_google_protobuf//src/google/protobuf/compiler:code_generator",
     ],
 )
 
@@ -452,6 +471,7 @@ filegroup(
 proto_library(
     name = "brpc_idl_options_proto",
     srcs = [":brpc_idl_options_proto_srcs"],
+    strip_import_prefix = "src",
     visibility = ["//visibility:public"],
     deps = [
         "@com_google_protobuf//:descriptor_proto",

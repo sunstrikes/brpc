@@ -23,7 +23,8 @@
 #include <map>
 #include <gtest/gtest.h>
 #include "bthread/bthread.h"
-#include "butil/gperftools_profiler.h"
+#include "gperftools_helper.h"
+#include "butil/compiler_specific.h"
 #include "butil/containers/doubly_buffered_data.h"
 #include "brpc/describable.h"
 #include "brpc/socket.h"
@@ -80,6 +81,16 @@ bool AddN(Foo& f, int n) {
     return true;
 }
 
+void read_cb(const Foo& f) {
+    ASSERT_EQ(0, f.x);
+}
+
+struct CallableObj {
+    void operator()(const Foo& f) {
+        ASSERT_EQ(0, f.x);
+    }
+};
+
 template <typename DBD>
 void test_doubly_buffered_data() {
     // test doubly_buffered_data TLS limits
@@ -98,16 +109,29 @@ void test_doubly_buffered_data() {
         ASSERT_EQ(0, ptr->x);
     }
     {
+        ASSERT_EQ(0, d.Read([](const Foo& f) {
+            ASSERT_EQ(0, f.x);
+        }));
+        ASSERT_EQ(0, d.Read(read_cb));
+        ASSERT_EQ(0, d.Read(CallableObj()));
+        CallableObj co;
+        ASSERT_EQ(0, d.Read(co));
+    }
+    {
         typename DBD::ScopedPtr ptr;
         ASSERT_EQ(0, d.Read(&ptr));
         ASSERT_EQ(0, ptr->x);
     }
 
     d.Modify(AddN, 10);
+    d.Modify([](Foo& f, int n) -> size_t {
+        f.x += n;
+        return 1;
+    }, 10);
     {
         typename DBD::ScopedPtr ptr;
         ASSERT_EQ(0, d.Read(&ptr));
-        ASSERT_EQ(10, ptr->x);
+        ASSERT_EQ(20, ptr->x);
     }
 }
 
@@ -1107,7 +1131,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
     {
         brpc::SocketUniquePtr dummy_ptr;
         ASSERT_EQ(1, brpc::Socket::AddressFailedAsWell(ptr[0]->id(), &dummy_ptr));
-        dummy_ptr->Revive();
+        dummy_ptr->Revive(2);
     }
     bthread_usleep(brpc::FLAGS_detect_available_server_interval_ms * 1000);
     // After one server is revived, the reject rate should be 50%
@@ -1132,6 +1156,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
     }
 }
 
+#ifndef BUTIL_USE_ASAN
 class EchoServiceImpl : public test::EchoService {
 public:
     EchoServiceImpl()
@@ -1191,11 +1216,11 @@ TEST_F(LoadBalancerTest, invalid_lb_params) {
 }
 
 TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_short_window_size", "20");
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_short_window_error_percent", "30");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_short_window_size", "20");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_short_window_error_percent", "30");
     // Those two lines force the interval of first hc to 3s
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms", "3000");
-    GFLAGS_NS::SetCommandLineOption("circuit_breaker_min_isolation_duration_ms", "3000");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_max_isolation_duration_ms", "3000");
+    GFLAGS_NAMESPACE::SetCommandLineOption("circuit_breaker_min_isolation_duration_ms", "3000");
 
     const char* lb_algo[] = { "random:min_working_instances=2 hold_seconds=2",
                               "rr:min_working_instances=2 hold_seconds=2" };
@@ -1228,14 +1253,14 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     }
 
     butil::EndPoint point(butil::IP_ANY, 7777);
-    brpc::Server server;
     EchoServiceImpl service;
+    brpc::Server server;
     ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server.Start(point, NULL));
 
     butil::EndPoint point2(butil::IP_ANY, 7778);
-    brpc::Server server2;
     EchoServiceImpl service2;
+    brpc::Server server2;
     ASSERT_EQ(0, server2.AddService(&service2, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server2.Start(point2, NULL));
     
@@ -1264,6 +1289,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     bthread_usleep(500000 /* sleep longer than timeout of channel */);
     ASSERT_EQ(0, num_failed.load(butil::memory_order_relaxed));
 }
+#endif // BUTIL_USE_ASAN
 
 TEST_F(LoadBalancerTest, la_selection_too_long) {
     brpc::GlobalInitializeOrDie();
